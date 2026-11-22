@@ -1,4 +1,10 @@
-# Limb
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme-logo-light-1200.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/readme-logo-dark-1200.png">
+    <img alt="Limb" src="./assets/readme-logo-dark-1200.png" width="360">
+  </picture>
+</h1>
 
 Limb — Swift-пакет для создания серверов [Model Context Protocol](https://modelcontextprotocol.io/).
 Сервер запускается локально, а MCP-клиент обменивается с ним сообщениями через стандартный ввод и вывод (stdio).
