@@ -11,7 +11,7 @@ public struct ServerBudgets: Sendable {
     public var maxQueuedBytes: Int
     /// Largest incoming frame.
     public var maxFrameBytes: Int
-    /// Largest outgoing response. A successful result is never truncated; exceeding this is an error.
+    /// Largest outgoing response or subscription acknowledgment. Exceeding this is an error.
     ///
     /// A `2025-03-26` batch reply is held to it as a whole: its largest members are replaced by
     /// that error. When even that cannot make it fit, every member gets the error under its own
