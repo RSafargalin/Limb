@@ -244,7 +244,7 @@ public final class Connection: Sendable {
         case .request(let id, _, _) where withinIDLimit(id) == nil:
             // Every answer echoes the id; bounding it keeps every error the reader builds small.
             let limit = configuration.budgets.maxRequestIDBytes
-            respond(Frame.error(id: nil, .invalidRequest("the request id is longer than \(limit) bytes")), id: nil, responder)
+            respond(Frame.error(id: nil, .invalidRequest("the request id exceeds the \(limit)-byte limit after JSON encoding")), id: nil, responder)
         case .request(let id, let method, let params):
             handleRequest(id: id, method: method, params: params, responder: responder, bytes: bytes)
         case .notification(let method, let params):
@@ -1769,7 +1769,7 @@ public final class Connection: Sendable {
 
     /// An id within `maxRequestIDBytes`, or `nil`: an answer never echoes a longer one.
     private func withinIDLimit(_ id: RequestID?) -> RequestID? {
-        guard let id, id.description.utf8.count <= configuration.budgets.maxRequestIDBytes else { return nil }
+        guard let id, id.fitsEncodedByteLimit(configuration.budgets.maxRequestIDBytes) else { return nil }
         return id
     }
 

@@ -32,9 +32,9 @@ public struct ServerBudgets: Sendable {
     /// Entries in a request's `inputResponses` (`2026-07-28`). A handler asks for a handful;
     /// a request with more is refused with `-32602`.
     public var maxInputResponses: Int
-    /// Longest request id, in bytes of its text. Every answer echoes the id, so this is what
-    /// keeps every error small; a request with a longer id is refused with `-32600` and a null
-    /// id. Keep it well below a sixteenth of the transport's urgent reserve.
+    /// Maximum UTF-8 size of a request ID after JSON encoding. For a string, the enclosing quotes
+    /// are fixed overhead and do not count toward the limit. An oversized request ID is rejected
+    /// with `-32600` and a null ID. Keep this limit well below a sixteenth of the urgent reserve.
     public var maxRequestIDBytes: Int
 
     public init(

@@ -32,6 +32,27 @@ public enum RequestID: Sendable, Hashable, CustomStringConvertible {
         }
     }
 
+    /// Tests the byte count of the encoded ID, excluding the two framing quotes for a string.
+    package func fitsEncodedByteLimit(_ limit: Int) -> Bool {
+        switch self {
+        case .number(let value):
+            return value.lexeme.utf8.count <= limit
+        case .string(let value):
+            let utf8 = value.utf8
+            let count = utf8.count
+            guard count <= limit else { return false }
+
+            // Both codecs write plain printable ASCII IDs without further escaping.
+            if utf8.allSatisfy({ $0 >= 0x20 && $0 < 0x7F && $0 != 0x22 && $0 != 0x5C }) {
+                return true
+            }
+
+            var writer = JSONWriter(capacity: count)
+            writer.write(value)
+            return writer.bytes.count - 2 <= limit
+        }
+    }
+
     /// String ids are the same id only when they are the same bytes: `String`'s own `==` would
     /// make "é" and "e" + combining accent one id, and a cancellation for one would hit the other.
     public static func == (lhs: RequestID, rhs: RequestID) -> Bool {
