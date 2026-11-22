@@ -3,12 +3,19 @@
 import CompilerPluginSupport
 import PackageDescription
 
-let settings: [SwiftSetting] = [
-    .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+let importSettings: [SwiftSetting] = [
     .enableUpcomingFeature("ExistentialAny"),
     .enableUpcomingFeature("MemberImportVisibility"),
     .enableUpcomingFeature("InternalImportsByDefault"),
 ]
+let settings = importSettings + [.enableUpcomingFeature("NonisolatedNonsendingByDefault")]
+
+#if compiler(<6.3)
+// Swift Testing 6.2 cannot run exit-test closures compiled with this feature.
+let testSettings = importSettings
+#else
+let testSettings = settings
+#endif
 
 let package = Package(
     name: "Limb",
@@ -61,5 +68,23 @@ let package = Package(
         .target(name: "Limb", dependencies: ["LimbCore", "LimbServer", "LimbStdio"], swiftSettings: settings),
         // In-memory harness for user tests.
         .target(name: "LimbTesting", dependencies: ["Limb"], swiftSettings: settings),
+
+        .testTarget(name: "LimbCoreTests", dependencies: ["LimbCore"], swiftSettings: testSettings),
+        .testTarget(name: "LimbServerTests", dependencies: ["Limb", "LimbTesting"], swiftSettings: testSettings),
+        .testTarget(name: "LimbStdioTests", dependencies: ["Limb", "LimbTesting"], swiftSettings: testSettings),
+        .testTarget(
+            name: "LimbMacrosTests",
+            dependencies: [
+                "Limb", "LimbTesting",
+                // For asserting expansions and diagnostics of the macros themselves.
+                "LimbMacros",
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftParser", package: "swift-syntax"),
+                .product(name: "SwiftDiagnostics", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacroExpansion", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacrosGenericTestSupport", package: "swift-syntax"),
+            ],
+            swiftSettings: testSettings),
     ]
 )
