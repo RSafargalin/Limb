@@ -44,7 +44,7 @@ public final class Connection: Sendable {
 
     // MARK: State
 
-    private struct LegacySession {
+    private struct LegacySession: Sendable {
         var profile: RevisionProfile
         var capabilities: ClientCapabilities
         var clientInfo: Implementation
@@ -65,6 +65,12 @@ public final class Connection: Sendable {
         case direct
         /// The response becomes one element of a JSON-RPC batch reply.
         case batch(BatchCollector, Int)
+    }
+
+    private struct Reply: Sendable {
+        let frame: [UInt8]
+        /// Installed only when this initialize result, rather than a replacement error, is queued.
+        var session: LegacySession? = nil
     }
 
     private struct Inflight {
@@ -346,17 +352,15 @@ public final class Connection: Sendable {
             respond(Frame.error(id: id, .responseTooLarge(bytes: frame.count, limit: limit)), id: id, responder)
             return
         }
-        if case .direct = responder, !isSmall(frame), sink.isOverBudget {
-            sendSmall(overloadAnswer(id: id))
-            return
-        }
-        // A repeated initialize renegotiates: cloud bridges keep one stdio process across sessions.
-        state.withLock { state in
-            releaseResourcesLocked(state.legacy?.resourceSubscriptions ?? [], &state)
-            state.legacy = session
-            dropUnwantedEventsLocked(&state)
-        }
-        respond(frame, id: id, responder)
+        respond(frame, id: id, responder, session: session)
+    }
+
+    private func installLegacySessionLocked(_ session: LegacySession, _ state: inout State) {
+        guard !state.closing else { return }
+        // A successful repeated initialize renegotiates and releases the old subscriptions.
+        releaseResourcesLocked(state.legacy?.resourceSubscriptions ?? [], &state)
+        state.legacy = session
+        dropUnwantedEventsLocked(&state)
     }
 
     private func writeCapabilities(to writer: inout JSONWriter, registry: RegistrySnapshot) {
@@ -1289,11 +1293,11 @@ public final class Connection: Sendable {
             if let entry = state.inflight[id], entry.serial == serial {
                 state.inflight[id] = nil
                 if let frame {
-                    deliverLocked(frame, entry.responder, key: id)
+                    deliverLocked(frame, entry.responder, key: id, &state)
                 } else {
                     // Ended by cancellation (by `close`, say): no response, but the batch it
                     // belongs to still has to be completed.
-                    settleBatchSlotLocked(entry.responder)
+                    settleBatchSlotLocked(entry.responder, &state)
                 }
             }
             withdrawn = withdrawClientRequestsLocked(&state, callerSerial: serial)
@@ -1339,11 +1343,7 @@ public final class Connection: Sendable {
             }
             // After cancellation nothing may be sent for the request, including what is already queued.
             sink.discard(key: id)
-            if case .batch(let collector, let slot) = entry.responder, let members = collector.fill(slot, nil),
-                let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes)
-            {
-                sink.enqueue(reply)
-            }
+            settleBatchSlotLocked(entry.responder, &state)
             return entry.task
         }
         server.withdraw(owner: ObjectIdentifier(self), serials: withdrawn)
@@ -1700,19 +1700,28 @@ public final class Connection: Sendable {
     /// - A frame that is not small goes out as ordinary output while that is within its
     ///   budget; otherwise `substitute`, which is small, is sent instead, as above.
     private func sendFromReader(_ frame: [UInt8], substitute: @autoclosure () -> [UInt8]) {
-        if isSmall(frame) {
-            sendSmall(frame)
-        } else if !sink.isOverBudget, sink.enqueue(frame, key: nil) {
-            return
-        } else {
-            sendSmall(substitute())
-        }
+        sendFromReader(Reply(frame: frame), substitute: Reply(frame: substitute()))
     }
 
-    private func sendSmall(_ frame: [UInt8]) {
-        if sink.enqueue(frame, key: nil, urgent: true) { return }
-        if !sink.isOverBudget, sink.enqueue(frame, key: nil) { return }
+    private func sendFromReader(_ reply: Reply, substitute: @autoclosure () -> Reply) {
+        let small = isSmall(reply.frame)
+        if enqueueReaderReply(reply, urgent: small) { return }
+        if !small, enqueueReaderReply(substitute(), urgent: true) { return }
         state.withLock { $0.overflowed = true }
+    }
+
+    private func enqueueReaderFrame(_ frame: [UInt8], urgent: Bool) -> Bool {
+        if urgent, sink.enqueue(frame, key: nil, urgent: true) { return true }
+        return !sink.isOverBudget && sink.enqueue(frame, key: nil)
+    }
+
+    private func enqueueReaderReply(_ reply: Reply, urgent: Bool) -> Bool {
+        guard let session = reply.session else { return enqueueReaderFrame(reply.frame, urgent: urgent) }
+        return state.withLock { state in
+            guard enqueueReaderFrame(reply.frame, urgent: urgent) else { return false }
+            installLegacySessionLocked(session, &state)
+            return true
+        }
     }
 
     /// Sends a frame with no request to answer (a parse error, say).
@@ -1722,14 +1731,16 @@ public final class Connection: Sendable {
 
     /// Answers a request from the reader, directly or as a member of a batch.
     /// `maxResponseBytes` applies as it does to handlers' results.
-    private func respond(_ frame: [UInt8], id: RequestID?, _ responder: Responder) {
+    private func respond(_ frame: [UInt8], id: RequestID?, _ responder: Responder, session: LegacySession? = nil) {
         let limit = configuration.budgets.maxResponseBytes
-        var frame = frame
-        if frame.count > limit, let id { frame = Frame.error(id: id, .responseTooLarge(bytes: frame.count, limit: limit)) }
+        var reply = Reply(frame: frame, session: session)
+        if frame.count > limit, let id {
+            reply = Reply(frame: Frame.error(id: id, .responseTooLarge(bytes: frame.count, limit: limit)))
+        }
         switch responder {
-        case .direct: sendFromReader(frame, substitute: self.overloadAnswer(id: id))
+        case .direct: sendFromReader(reply, substitute: Reply(frame: self.overloadAnswer(id: id)))
         case .batch(let collector, let slot):
-            if let members = collector.fill(slot, BatchCollector.Member(frame: frame, id: id, fromReader: true)) {
+            if let members = collector.fill(slot, BatchCollector.Member(reply: reply, id: id, fromReader: true)) {
                 sendBatchFromReader(members)
             }
         }
@@ -1742,7 +1753,7 @@ public final class Connection: Sendable {
     /// a reply that is still not small goes out as ordinary output.
     private func sendBatchFromReader(_ members: [BatchCollector.Member]) {
         guard let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes) else { return }
-        if isSmall(reply) || !sink.isOverBudget {
+        if isSmall(reply.frame) || !sink.isOverBudget {
             sendFromReader(reply, substitute: reply)
             return
         }
@@ -1750,13 +1761,19 @@ public final class Connection: Sendable {
         // next to a large listing keeps its result.
         var replaced = members
         var shorter = reply
-        let order = members.indices.filter { members[$0].fromReader }.sorted { members[$0].frame.count > members[$1].frame.count }
-        for index in order where !isSmall(shorter) {
-            replaced[index] = BatchCollector.Member(frame: overloadAnswer(id: members[index].id), id: members[index].id, fromReader: true)
+        let order = members.indices.filter { members[$0].fromReader }.sorted {
+            members[$0].reply.frame.count > members[$1].reply.frame.count
+        }
+        for index in order where !isSmall(shorter.frame) {
+            replaced[index].reply = Reply(frame: overloadAnswer(id: members[index].id))
             guard let joined = BatchCollector.join(replaced, maxBytes: configuration.budgets.maxResponseBytes) else { return }
             shorter = joined
         }
-        if isSmall(shorter) { sendSmall(shorter) } else { sink.enqueue(shorter, key: nil) }
+        if isSmall(shorter.frame) {
+            sendFromReader(shorter, substitute: shorter)
+        } else {
+            state.withLock { state in enqueueBatchLocked(shorter, &state) }
+        }
     }
 
     /// A batch member that gets no response settles its slot all the same, or the reply would
@@ -1773,15 +1790,21 @@ public final class Connection: Sendable {
         return id
     }
 
-    private func deliverLocked(_ frame: [UInt8], _ responder: Responder, key: RequestID) {
+    private func deliverLocked(_ frame: [UInt8], _ responder: Responder, key: RequestID, _ state: inout State) {
         switch responder {
         case .direct: sink.enqueue(frame, key: key)
         case .batch(let collector, let slot):
-            if let members = collector.fill(slot, BatchCollector.Member(frame: frame, id: key, fromReader: false)),
+            if let members = collector.fill(slot, BatchCollector.Member(reply: Reply(frame: frame), id: key, fromReader: false)),
                 let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes)
             {
-                sink.enqueue(reply)
+                enqueueBatchLocked(reply, &state)
             }
+        }
+    }
+
+    private func enqueueBatchLocked(_ reply: Reply, _ state: inout State) {
+        if sink.enqueue(reply.frame), let session = reply.session {
+            installLegacySessionLocked(session, &state)
         }
     }
 
@@ -1841,7 +1864,7 @@ public final class Connection: Sendable {
                         withdrawn.insert(entry.serial)
                         state.inflight[id] = nil
                         state.pending -= 1
-                        settleBatchSlotLocked(entry.responder)
+                        settleBatchSlotLocked(entry.responder, &state)
                     }
                 }
                 return running
@@ -1854,7 +1877,7 @@ public final class Connection: Sendable {
         // Whatever is still running was told to stop and did not. From here on it is not a
         // request any more: nothing it reports or returns is sent.
         let suppressed: [(DiagnosticKind, Int)] = state.withLock { state in
-            for entry in state.inflight.values { settleBatchSlotLocked(entry.responder) }
+            for entry in state.inflight.values { settleBatchSlotLocked(entry.responder, &state) }
             state.inflight = [:]
             return state.reports.compactMap { kind, count in count > Self.reportLimit ? (kind, count - Self.reportLimit) : nil }
         }
@@ -1866,11 +1889,11 @@ public final class Connection: Sendable {
 
     /// A batch member cut off by `close` gets no response, but the members that finished
     /// still get theirs: the slot is settled so that the reply can be complete.
-    private func settleBatchSlotLocked(_ responder: Responder) {
+    private func settleBatchSlotLocked(_ responder: Responder, _ state: inout State) {
         if case .batch(let collector, let slot) = responder, let members = collector.fill(slot, nil),
             let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes)
         {
-            sink.enqueue(reply)
+            enqueueBatchLocked(reply, &state)
         }
     }
 
@@ -1927,69 +1950,74 @@ public final class Connection: Sendable {
             return state.pending == 0
         }
     }
-}
 
-/// Gathers the responses of a JSON-RPC batch; the last one completes it.
-final class BatchCollector: Sendable {
-    struct Member: Sendable {
-        var frame: [UInt8]
-        /// The id the response carries.
-        var id: RequestID?
-        /// Built on the reader (a listing, an error), not by a handler.
-        var fromReader: Bool
-    }
+    // MARK: Batch collection
 
-    private struct Slots {
-        var members: [Member?]
-        var remaining: Int
-    }
-
-    private let slots: Mutex<Slots>
-
-    init(slots count: Int) {
-        slots = Mutex(Slots(members: Array(repeating: nil, count: count), remaining: count))
-    }
-
-    /// Records one response (`nil` for one that is not sent). Returns every response once the
-    /// last slot is settled, or `nil` if there is nothing to send yet or at all.
-    func fill(_ slot: Int, _ member: Member?) -> [Member]? {
-        slots.withLock { slots in
-            slots.members[slot] = member
-            slots.remaining -= 1
-            guard slots.remaining == 0 else { return nil }
-            let present = slots.members.compactMap { $0 }
-            return present.isEmpty ? nil : present
+    /// Gathers the responses of a JSON-RPC batch; the last one completes it.
+    private final class BatchCollector: Sendable {
+        struct Member: Sendable {
+            var reply: Reply
+            /// The id the response carries.
+            let id: RequestID?
+            /// Built on the reader (a listing, an error), not by a handler.
+            let fromReader: Bool
         }
-    }
 
-    /// The batch reply. Each member fits `maxBytes` alone; if together they do not, the
-    /// largest are replaced by the error a single response that does not fit gets, until the
-    /// reply fits. If that cannot make it fit — many members, each smaller than that error —
-    /// every member is answered with that error under its own id: the client can settle every
-    /// request, and the reply is then bounded by the ids the client sent, not by `maxBytes`.
-    static func join(_ members: [Member], maxBytes: Int) -> [UInt8]? {
-        guard !members.isEmpty else { return nil }
-        var frames = members.map(\.frame)
-        // Brackets and commas.
-        var total = frames.reduce(1) { $0 + $1.count + 1 }
-        func tooLarge(_ index: Int) -> [UInt8] {
-            Frame.error(id: members[index].id, .responseTooLarge(bytes: frames[index].count, limit: maxBytes, inBatch: true))
+        private struct Slots {
+            var members: [Member?]
+            var remaining: Int
         }
-        while total > maxBytes, let largest = frames.indices.max(by: { frames[$0].count < frames[$1].count }) {
-            let error = tooLarge(largest)
-            guard error.count < frames[largest].count else { break }
-            total -= frames[largest].count - error.count
-            frames[largest] = error
+
+        private let slots: Mutex<Slots>
+
+        init(slots count: Int) {
+            slots = Mutex(Slots(members: Array(repeating: nil, count: count), remaining: count))
         }
-        if total > maxBytes { frames = frames.indices.map(tooLarge) }
-        var batch: [UInt8] = [0x5B]
-        batch.reserveCapacity(total)
-        for (index, frame) in frames.enumerated() {
-            if index > 0 { batch.append(0x2C) }
-            batch.append(contentsOf: frame)
+
+        /// Records one response (`nil` for one that is not sent). Returns every response once the
+        /// last slot is settled, or `nil` if there is nothing to send yet or at all.
+        func fill(_ slot: Int, _ member: Member?) -> [Member]? {
+            slots.withLock { slots in
+                slots.members[slot] = member
+                slots.remaining -= 1
+                guard slots.remaining == 0 else { return nil }
+                let present = slots.members.compactMap { $0 }
+                return present.isEmpty ? nil : present
+            }
         }
-        batch.append(0x5D)
-        return batch
+
+        /// Replaces the largest members with size errors until the batch fits. If that fails,
+        /// every member gets a size error under its own id. Only the last surviving initialize
+        /// result can change the session when the batch is queued.
+        static func join(_ members: [Member], maxBytes: Int) -> Reply? {
+            guard !members.isEmpty else { return nil }
+            var members = members
+            // Brackets and commas.
+            var total = members.reduce(1) { $0 + $1.reply.frame.count + 1 }
+            func tooLarge(_ member: Member) -> Member {
+                let error = Frame.error(
+                    id: member.id, .responseTooLarge(bytes: member.reply.frame.count, limit: maxBytes, inBatch: true))
+                return Member(reply: Reply(frame: error), id: member.id, fromReader: member.fromReader)
+            }
+            while total > maxBytes,
+                let largest = members.indices.max(by: { members[$0].reply.frame.count < members[$1].reply.frame.count })
+            {
+                let error = tooLarge(members[largest])
+                guard error.reply.frame.count < members[largest].reply.frame.count else { break }
+                total -= members[largest].reply.frame.count - error.reply.frame.count
+                members[largest] = error
+            }
+            if total > maxBytes { members = members.map(tooLarge) }
+            var batch: [UInt8] = [0x5B]
+            batch.reserveCapacity(total)
+            for (index, member) in members.enumerated() {
+                if index > 0 { batch.append(0x2C) }
+                batch.append(contentsOf: member.reply.frame)
+            }
+            batch.append(0x5D)
+            let session = members.last(where: { $0.reply.session != nil })?.reply.session
+            return Reply(frame: batch, session: session)
+        }
     }
 }
 
