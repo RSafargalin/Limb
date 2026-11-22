@@ -1427,8 +1427,8 @@ public final class Connection: Sendable {
             subscription.uris = Set(uris.map(ExactString.init))
         }
         let accepted = subscription
-        // The acknowledgment must be the first message on the subscription, so it is queued in
-        // the same critical section that makes the subscription visible to notifications.
+        // Queue the acknowledgment before registering the subscription under the same lock.
+        // That keeps it ahead of any events and leaves no subscription on refusal.
         let refusal: MCPError? = state.withLock { state in
             // A stream opened while the connection closes is simply not served.
             if state.closing { return nil }
@@ -1441,11 +1441,7 @@ public final class Connection: Sendable {
             guard resourcesFitLocked(accepted.uris, state, budgets) else {
                 return MCPError.overloaded("too many resource subscriptions on this connection")
             }
-            retainResourcesLocked(accepted.uris, &state)
-            let serial = state.nextSerial
-            state.nextSerial += 1
-            state.inflight[id] = Inflight(serial: serial, task: nil, responder: responder, isSubscription: true)
-            state.subscriptions[id] = accepted
+            guard !sink.isOverBudget else { return Self.outputBackpressureError }
             let acknowledgment = Frame.notification(method: "notifications/subscriptions/acknowledged") { writer in
                 writer.beginObject()
                 writer.key("_meta")
@@ -1461,7 +1457,15 @@ public final class Connection: Sendable {
                 writer.endObject()
                 writer.endObject()
             }
-            sink.enqueue(acknowledgment, key: id)
+            guard acknowledgment.count <= budgets.maxResponseBytes else {
+                return MCPError.responseTooLarge(bytes: acknowledgment.count, limit: budgets.maxResponseBytes)
+            }
+            guard sink.enqueue(acknowledgment, key: id) else { return Self.outputBackpressureError }
+            retainResourcesLocked(accepted.uris, &state)
+            let serial = state.nextSerial
+            state.nextSerial += 1
+            state.inflight[id] = Inflight(serial: serial, task: nil, responder: responder, isSubscription: true)
+            state.subscriptions[id] = accepted
             return nil
         }
         if let refusal { throw refusal }
@@ -1677,10 +1681,12 @@ public final class Connection: Sendable {
         return frame.count <= min(reserve, max(reserve / 16, 4096))
     }
 
+    private static let outputBackpressureError = MCPError.overloaded("the client is not reading responses; retry later")
+
     /// The answer the reader sends instead of a frame that is not small while the peer is
     /// behind. Small by construction: a constant text and an id within `maxRequestIDBytes`.
     private func overloadAnswer(id: RequestID?) -> [UInt8] {
-        Frame.error(id: id, .overloaded("the client is not reading responses; retry later"))
+        Frame.error(id: id, Self.outputBackpressureError)
     }
 
     /// Sends a frame from the reader, which must not wait. Every frame given here is sent as
