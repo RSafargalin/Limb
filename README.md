@@ -1,4 +1,4 @@
-<h1>
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/readme-logo-light-1200.png">
     <source media="(prefers-color-scheme: light)" srcset="./assets/readme-logo-dark-1200.png">
