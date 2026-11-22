@@ -1,8 +1,8 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme-logo-light-1200.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/readme-logo-dark-1200.png">
-    <img alt="Limb" src="./assets/readme-logo-dark-1200.png" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme-logo-dark-1200.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/readme-logo-light-1200.png">
+    <img alt="Limb" src="./assets/readme-logo-light-1200.png" width="360">
   </picture>
 </h1>
 
