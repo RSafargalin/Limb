@@ -1,9 +1,6 @@
 <h1 align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/readme-logo-dark-1200.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/readme-logo-light-1200.png">
-    <img alt="Limb" src="./assets/readme-logo-light-1200.png" width="360">
-  </picture>
+  <img alt="Limb" src="./assets/limb-logo-black-1200.png#gh-light-mode-only" width="360">
+  <img alt="Limb" src="./assets/limb-logo-white-1200.png#gh-dark-mode-only" width="360">
 </h1>
 
 Limb — Swift-пакет для создания серверов [Model Context Protocol](https://modelcontextprotocol.io/).
