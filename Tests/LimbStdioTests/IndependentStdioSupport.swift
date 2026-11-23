@@ -466,6 +466,21 @@ final class IndependentStdioClient: @unchecked Sendable {
     @discardableResult
     func send(_ bytes: [UInt8], timeout: Double = 30, absorb: Bool = true) -> Bool {
         guard writeEnd >= 0 else { return false }
+        // A test client may still be sending when the server closes its input.
+        #if canImport(Darwin)
+        guard fcntl(writeEnd, F_SETNOSIGPIPE, 1) == 0 else { return false }
+        #elseif canImport(Glibc)
+        var brokenPipe = sigset_t()
+        sigemptyset(&brokenPipe)
+        sigaddset(&brokenPipe, SIGPIPE)
+        var previousMask = sigset_t()
+        guard pthread_sigmask(SIG_BLOCK, &brokenPipe, &previousMask) == 0 else { return false }
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+        var pending = sigset_t()
+        guard sigpending(&pending) == 0 else { return false }
+        let hadPendingBrokenPipe = sigismember(&pending, SIGPIPE) == 1
+        #endif
+
         let deadline = Date().addingTimeInterval(timeout)
         var offset = 0
         while offset < bytes.count {
@@ -474,8 +489,16 @@ final class IndependentStdioClient: @unchecked Sendable {
                 offset += written
                 continue
             }
-            if written < 0, errno == EINTR { continue }
-            guard written < 0, errno == EAGAIN else { return false }
+            let failure = errno
+            #if canImport(Glibc)
+            if written < 0, failure == EPIPE, !hadPendingBrokenPipe {
+                // Consume the signal from this write before restoring the caller's mask.
+                var noWait = timespec()
+                while sigtimedwait(&brokenPipe, nil, &noWait) == -1, errno == EINTR {}
+            }
+            #endif
+            if written < 0, failure == EINTR { continue }
+            guard written < 0, failure == EAGAIN else { return false }
             if Date() >= deadline { return false }
             var descriptors = [pollfd(fd: writeEnd, events: Int16(POLLOUT), revents: 0)]
             if absorb, readEnd >= 0, !sawEndOfOutput {

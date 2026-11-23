@@ -86,8 +86,10 @@ extension Server {
     /// processes started meanwhile inherit stderr as their stdout. Only one session using
     /// stdin or stdout may run at once. A second such call reports a diagnostic and returns.
     ///
-    /// The dedicated writer blocks `SIGPIPE` on its own thread, so a peer that closes its
-    /// end surfaces as `EPIPE` while the application retains its signal disposition.
+    /// A closed output is handled as `EPIPE` with the application's `SIGPIPE` disposition
+    /// intact. On Darwin the writer temporarily enables `F_SETNOSIGPIPE` on the output's
+    /// shared open file description. Coordinate changes to that option on aliased descriptors
+    /// with the writer's lifetime, which can extend beyond `run` when output stops draining.
     public func run(_ transport: StdioTransport = StdioTransport()) async {
         let usesStandardStreams = transport.input == STDIN_FILENO || transport.output == STDOUT_FILENO
         if usesStandardStreams, !StandardStreamOwnership.acquire() {
@@ -500,12 +502,20 @@ final class StdioSession: Sendable {
     // MARK: Writer
 
     private func writeLoop() {
+        #if canImport(Darwin)
+        // Darwin delivers SIGPIPE from pipe writes to the process, even if this thread
+        // blocks it. F_SETNOSIGPIPE applies to the duplicate and its aliases.
+        let previousNoSignal = output >= 0 ? fcntl(output, F_GETNOSIGPIPE) : 1
+        let configured = previousNoSignal > 0 || (previousNoSignal == 0 && fcntl(output, F_SETNOSIGPIPE, 1) == 0)
+        let status = configured ? 0 : errno
+        #else
         var blocked = sigset_t()
         sigemptyset(&blocked)
         sigaddset(&blocked, SIGPIPE)
         let status = pthread_sigmask(SIG_BLOCK, &blocked, nil)
+        #endif
         if status != 0 {
-            diagnostics("stdio: could not block SIGPIPE on the writer thread: \(String(cString: strerror(status)))")
+            diagnostics("stdio: could not suppress SIGPIPE for the writer: \(String(cString: strerror(status)))")
             queue.close()
             stopReading()
             connection.endGracePeriod()
@@ -525,7 +535,14 @@ final class StdioSession: Sendable {
             }
             queue.didWrite()
         }
-        if output >= 0 { close(output) }
+        if output >= 0 {
+            #if canImport(Darwin)
+            if configured, previousNoSignal == 0, fcntl(output, F_SETNOSIGPIPE, 0) < 0 {
+                diagnostics("stdio: could not restore the output SIGPIPE option: \(String(cString: strerror(errno)))")
+            }
+            #endif
+            close(output)
+        }
         let waiter = completion.withLock { state in
             state.writerDone = true
             defer { state.writerWaiter = nil }

@@ -33,6 +33,20 @@ import Testing
             await StdioOwnershipProbe.run { try await StdioOwnershipProbe.checkSignalDisposition() }
         }
     }
+
+    @Test func closingThePeerOutputEndsTheSessionWithDefaultSignalDisposition() async {
+        await #expect(processExitsWith: .success) {
+            await StdioOwnershipProbe.run { try await StdioOwnershipProbe.checkPeerDeparture() }
+        }
+    }
+
+    #if canImport(Darwin)
+    @Test func writerRestoresTheCallersOutputSignalOption() async {
+        await #expect(processExitsWith: .success) {
+            await StdioOwnershipProbe.run { try await StdioOwnershipProbe.checkOutputSignalOption() }
+        }
+    }
+    #endif
 }
 
 // Every probe runs in a Swift Testing child process. Pipes and descriptors stay open unless
@@ -102,10 +116,14 @@ private enum StdioOwnershipProbe {
 
         var transport: StdioTransport { StdioTransport(input: input.readEnd, output: output.writeEnd) }
 
-        func listTools(id: Int, serverName: String) throws {
+        func requestToolList(id: Int) throws {
             try input.send(
                 #"{"jsonrpc":"2.0","id":\#(id),"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#
             )
+        }
+
+        func listTools(id: Int, serverName: String) throws {
+            try requestToolList(id: id)
             let line = try output.receiveLine()
             let reply = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
             let result = reply?["result"] as? [String: Any]
@@ -249,6 +267,32 @@ private enum StdioOwnershipProbe {
         try await session.waitForReturn("The signal test session did not finish at EOF")
         try check(try sigpipeDisposition() == before, "Transport shutdown changed the SIGPIPE disposition")
     }
+
+    static func checkPeerDeparture() async throws {
+        let previous = signal(SIGPIPE, SIG_DFL)
+        try check(unsafeBitCast(previous, to: UInt.self) != unsafeBitCast(SIG_ERR, to: UInt.self), "Could not use the default disposition")
+        let peer = try Peer()
+        let session = try Session(name: "peer-departure", transport: peer.transport)
+        try peer.listTools(id: 1, serverName: "peer-departure")
+        try check(close(peer.output.readEnd) == 0, "Could not close the peer's output reader")
+        try peer.requestToolList(id: 2)
+        try await session.waitForReturn("The server did not return after the peer closed its reader")
+    }
+
+    #if canImport(Darwin)
+    static func checkOutputSignalOption() async throws {
+        for original: Int32 in [0, 1] {
+            let peer = try Peer()
+            let output = peer.output.writeEnd
+            try check(fcntl(output, F_SETNOSIGPIPE, original) == 0, "Could not configure the caller's output")
+            let session = try Session(name: "signal-option", transport: peer.transport)
+            try peer.listTools(id: 1, serverName: "signal-option")
+            try peer.endInput()
+            try await session.waitForReturn("The session did not end after EOF")
+            try check(fcntl(output, F_GETNOSIGPIPE) == original, "The writer changed the caller's option after shutdown")
+        }
+    }
+    #endif
 
     private static func installSignalDisposition() throws -> UInt {
         // Install an application-owned disposition in this child. The test never sends SIGPIPE.
