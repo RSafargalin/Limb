@@ -51,7 +51,7 @@ struct StackGuard {
     }
 
     /// Stack kept free below the budget for whatever the algorithm calls at its deepest point.
-    static let reserve = 32 * 1024
+    static let reserve = 64 * 1024
 
     /// Bytes of stack left on the current thread, or `nil` where the platform does not say.
     static var remaining: Int? {

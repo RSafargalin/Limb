@@ -457,7 +457,7 @@ private func round2SchemaFuzz(_ count: Int, seed: UInt64) -> Int {
 /// Random number texts through every JSONNumber API and the decoders.
 private func round2NumberFuzz(_ count: Int, seed: UInt64) {
     var random = Round2TrapRandom(state: seed)
-    let divisors = ["1", "0.5", "7", "1e-9999999999999999999", "9999999999999999999"].map { try! JSONSchema(["multipleOf": .number(JSONNumber(lexeme: $0)!)]) }
+    let divisors = ["1", "0.5", "7", "1e-1000000000000000001", "9999999999999999999"].map { try! JSONSchema(["multipleOf": .number(JSONNumber(lexeme: $0)!)]) }
     var previous = JSONNumber(0)
     for _ in 0..<count {
         var text = Bool.random(using: &random) ? "-" : ""
@@ -580,7 +580,13 @@ private func round2WriterFuzz(_ count: Int, seed: UInt64) -> Int {
         }
     }
 
-    @Test func randomNumberTextsNeverTrapAndDoubleValueIsStrtod() async {
+    @Test func randomNumberTextsNeverTrapAndDoubleValueIsStrtod() async throws {
+        let unsupportedDivisor = try #require(JSONNumber(lexeme: "1e-9999999999999999999"))
+        let error = #expect(throws: JSONSchemaError.self) {
+            try JSONSchema(["multipleOf": .number(unsupportedDivisor)])
+        }
+        #expect(error?.reason.lowercased().contains("exponent") == true)
+
         await #expect(processExitsWith: .success) {
             round2NumberFuzz(100_000 * round2Scale(), seed: 0x4E55_4D42)
         }

@@ -473,6 +473,7 @@ private struct Compiler {
     ) -> (result: Result<Compiled, JSONSchemaError>, exhausted: Bool) {
         var compiler = Compiler(document: schema, registeredSchemas: registeredSchemas, limits: limits, isDraft7: isDraft7, stack: stack)
         do throws(JSONSchemaError) {
+            guard !stack.isExhausted else { throw JSONSchemaError(reason: "out of stack", pointer: "") }
             try compiler.indexLocations()
             let root = try compiler.compile(schema, pointer: "", depth: 0)
             while let resource = compiler.neededResources.popFirst() {
@@ -1118,13 +1119,22 @@ extension JSONSchema {
         _ index: Int, _ instance: JSONValue, _ recursion: Int, _ hops: Int, _ run: Evaluation,
         contributingTo parent: EvaluatedLocations? = nil
     ) -> SchemaViolation? {
-        guard recursion < limits.maxValidationRecursion, !run.stack.isExhausted else {
+        guard recursion < limits.maxValidationRecursion, !run.stack.wasExhausted, !run.stack.isExhausted else {
             return run.cutShort("nested deeper than the validator allows")
         }
         guard run.step() else { return fail("the schema takes too many steps") }
         guard hops <= nodes.count else {
             return run.cutShort("the schema refers to itself without consuming input")
         }
+        return checkNode(index, instance, recursion, hops, run, contributingTo: parent)
+    }
+
+    // Keep the larger evaluation frame separate from the stack check in debug builds as well.
+    @inline(never)
+    private func checkNode(
+        _ index: Int, _ instance: JSONValue, _ recursion: Int, _ hops: Int, _ run: Evaluation,
+        contributingTo parent: EvaluatedLocations?
+    ) -> SchemaViolation? {
         let node = nodes[index]
         if let always = node.always { return always ? nil : fail("no value is allowed here") }
         var enteredResource = false
