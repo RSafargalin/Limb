@@ -64,6 +64,41 @@ import Testing
         #expect(parsed[6]?["0"] == .string("false"))
     }
 
+    @Test func mixedValuesAndUnicodeKeysSurviveReencoding() throws {
+        let document = #"{"outer":{"caf\u00e9":[9223372036854775807,"9223372036854775807",true],"cafe\u0301":[-0.0,false,"\ud83d\ude03"],"a\ufeffb":"left\ufeffright"}}"#
+        let decoded = try JSON.parse(Array(document.utf8))
+        let roundTrip = try JSON.parse(decoded.encoded())
+        for value in [decoded, roundTrip] {
+            let object = try #require(value["outer"]?.objectValue)
+            #expect(object.count == 3)
+            let composed = try #require(object["caf\u{E9}"]?.arrayValue)
+            let decomposed = try #require(object["cafe\u{301}"]?.arrayValue)
+            try #require(composed.count == 3 && decomposed.count == 3)
+            #expect(composed[0].numberValue?.int64Value == .max)
+            #expect(composed[0].description == "9223372036854775807")
+            #expect(composed[1] == .string("9223372036854775807"))
+            #expect(composed[2] == .bool(true))
+            #expect(decomposed[0].numberValue?.description == "-0.0")
+            #expect(decomposed[1] == .bool(false))
+            #expect(decomposed[2] == .string("😃"))
+            #expect(object["a\u{FEFF}b"] == .string("left\u{FEFF}right"))
+        }
+    }
+
+    @Test func escapedDuplicateKeyFollowsTheSelectedCodecPolicy() throws {
+        let document = #"{"outer":{"caf\u00e9":"first","café":2.00}}"#
+        #if FoundationJSON
+        let value = try JSON.parse(Array(document.utf8))
+        let object = try #require(value["outer"]?.objectValue)
+        #expect(object.count == 1)
+        let survivor = try #require(object["café"])
+        #expect(survivor == .string("first") || survivor.numberValue?.description == "2.00")
+        #expect(try JSON.parse(value.encoded()) == value)
+        #else
+        #expect(throws: JSONParseError.self) { try JSON.parse(Array(document.utf8)) }
+        #endif
+    }
+
     @Test(arguments: ["01", "-01", "+1", ".5", "-.5", "1.", "1e", "1e+", "1e-", "NaN", "Infinity", "0x1"])
     func malformedNumberFormsAreRejected(_ token: String) {
         let documents = [token, "[true,\(token),\"\(token)\"]", "{\"\(token)\":\(token)}"]
