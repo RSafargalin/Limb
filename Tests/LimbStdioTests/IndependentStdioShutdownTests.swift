@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Testing
@@ -23,6 +28,7 @@ extension IndependentStdioTransportTests {
     @Suite struct Shutdown {
         // MARK: End of input
 
+        #if canImport(Darwin)
         @Test(arguments: [IndependentStdioClient.Channel.pipes, .socketpair])
         func anIdleSessionUsesNoCPUAndEndsPromptlyAtEndOfInput(channel: IndependentStdioClient.Channel) throws {
             let fixture = try independentStdioFixture()
@@ -59,7 +65,9 @@ extension IndependentStdioTransportTests {
             #expect(gone, "transport threads outlived run()")
             #expect(fixture.log.all == [])
         }
+        #endif
 
+        #if canImport(Darwin)
         @Test func nothingSpinsWhileRequestsInFlightUseTheGracePeriod() throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 1.5 }
             let before = Set(independentStdioTransportThreads().map(\.id))
@@ -84,6 +92,7 @@ extension IndependentStdioTransportTests {
             #expect(took >= 1.4 && took < 10, "run returned \(took) s after end of input; the grace period is 1.5 s")
             #expect(fixture.probe.cancelledTags == ["slow"])
         }
+        #endif
 
         @Test func requestsRunningAndQueuedAtEndOfInputAreAnswered() throws {
             let fixture = try independentStdioFixture { $0.budgets.maxConcurrentHandlers = 2 }
@@ -276,6 +285,7 @@ extension IndependentStdioTransportTests {
             #expect(IndependentStdioDescriptorState(client.serverInput) != nil)
         }
 
+        #if canImport(Darwin)
         @Test func sigpipeIsIgnoredAfterASessionAsTheDesignSays() throws {
             let fixture = try independentStdioFixture()
             let client = Client.ready(fixture.server)
@@ -287,6 +297,7 @@ extension IndependentStdioTransportTests {
             // SIG_IGN is the handler value 1.
             #expect(unsafeBitCast(current.__sigaction_u.__sa_handler, to: Int.self) == 1, "SIGPIPE is not ignored")
         }
+        #endif
 
         @Test func requestsInFlightAreCancelledWhenTheClientIsGone() throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 30 }
@@ -307,6 +318,7 @@ extension IndependentStdioTransportTests {
     }
 
     @Suite struct Lifecycle {
+        #if canImport(Darwin)
         /// Counts are taken for the whole process. The author's suite in this target may have
         /// one session open at the same moment (two threads, up to five descriptors), hence the
         /// small allowance; a leak of one descriptor or thread per session would show as hundreds.
@@ -320,7 +332,9 @@ extension IndependentStdioTransportTests {
             } while Date() < deadline
             return best
         }
+        #endif
 
+        #if canImport(Darwin)
         @Test func hundredsOfSessionsOnOneServerLeakNoDescriptorsOrThreads() throws {
             let fixture = try independentStdioFixture()
             func session(_ index: Int) -> Bool {
@@ -343,7 +357,9 @@ extension IndependentStdioTransportTests {
             #expect(after.threads <= threads + 2, "transport threads: \(threads) before, \(after.threads) after 400 sessions")
             #expect(fixture.log.all == [])
         }
+        #endif
 
+        #if canImport(Darwin)
         /// The other ways a session ends must clean up too: the client goes away (EPIPE), the
         /// task is cancelled, the connection is dropped after a second oversized frame.
         @Test func sessionsThatEndAbnormallyLeakNoDescriptorsOrThreads() throws {
@@ -380,6 +396,7 @@ extension IndependentStdioTransportTests {
             #expect(after.descriptors <= descriptors + 6, "open descriptors: \(descriptors) before, \(after.descriptors) after 150 sessions")
             #expect(after.threads <= threads + 2, "transport threads: \(threads) before, \(after.threads) after 150 sessions")
         }
+        #endif
 
         @Test func sessionsAtTheSameTimeOnOneServerDoNotMix() throws {
             // Handler admission is one gate for the whole server: leave room for all 480 requests.

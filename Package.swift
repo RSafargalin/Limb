@@ -71,7 +71,13 @@ let package = Package(
 
         .testTarget(name: "LimbCoreTests", dependencies: ["LimbCore"], swiftSettings: testSettings),
         .testTarget(name: "LimbServerTests", dependencies: ["Limb", "LimbTesting"], swiftSettings: testSettings),
-        .testTarget(name: "LimbStdioTests", dependencies: ["Limb", "LimbTesting"], swiftSettings: testSettings),
+        .testTarget(
+            name: "LimbStdioTests",
+            dependencies: [
+                "Limb", "LimbTesting",
+                .product(name: "Crypto", package: "swift-crypto", condition: .when(platforms: [.linux])),
+            ],
+            swiftSettings: testSettings),
         .testTarget(
             name: "LimbMacrosTests",
             dependencies: [

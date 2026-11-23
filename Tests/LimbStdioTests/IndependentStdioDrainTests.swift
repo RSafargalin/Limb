@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Synchronization
@@ -6,6 +11,13 @@ import Testing
 
 private typealias Client = IndependentStdioClient
 
+#if canImport(Darwin)
+private let openFilesResource = RLIMIT_NOFILE
+#elseif canImport(Glibc)
+private let openFilesResource = __rlimit_resource_t(RLIMIT_NOFILE.rawValue)
+#endif
+
+#if canImport(Darwin)
 private struct Abandoned {
     let client: IndependentStdioClient
     let fixture: IndependentStdioFixture
@@ -38,6 +50,7 @@ private func abandonedSession(socket: Bool, nonBlocking: Bool, drain: Double = 0
     }
     return Abandoned(client: client, fixture: fixture, writer: left)
 }
+#endif
 
 private struct PacedOutcome {
     /// `run` logged that it gave up on the reader.
@@ -58,7 +71,9 @@ private func pacedDrain(channel: IndependentStdioClient.Channel, nonBlocking: Bo
     let capacity = channel == .pipes ? 64 * 1024 : 8 * 1024
     let size = burst + capacity + 12 * 1024
     let fixture = try independentStdioFixture { $0.outputDrainSeconds = limit }
+    #if canImport(Darwin)
     let before = Set(independentStdioTransportThreads().map(\.id))
+    #endif
     let client = Client(fixture.server, channel: channel)
     defer { client.tearDown() }
     if nonBlocking { independentStdioSetNonBlocking(client.serverOutput) }
@@ -94,11 +109,14 @@ private func pacedDrain(channel: IndependentStdioClient.Channel, nonBlocking: Bo
     let answer = client.responses(to: [1], timeout: 30)[1]
     let intact = Client.text(of: answer) == independentStdioBlob(size: size, seed: 7) && client.violations == []
     #expect(client.stopped(within: 10))
+    #if canImport(Darwin)
     let left = Set(independentStdioTransportThreads().map(\.id)).subtracting(before)
     #expect(threadsGone(left, within: 5))
+    #endif
     return PacedOutcome(gaveUp: gaveUp, steps: steps, log: fixture.log.all, intact: intact)
 }
 
+#if canImport(Darwin)
 private func threadsGone(_ ids: Set<UInt64>, within seconds: Double) -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while true {
@@ -107,6 +125,7 @@ private func threadsGone(_ ids: Set<UInt64>, within seconds: Double) -> Bool {
         usleep(10_000)
     }
 }
+#endif
 
 extension IndependentStdioTransportTests {
     @Suite struct Drain {
@@ -156,7 +175,9 @@ extension IndependentStdioTransportTests {
 
         @Test func aSteadyReaderIsWaitedForBeyondTheLimit() throws {
             let fixture = try independentStdioFixture { $0.outputDrainSeconds = 0.5 }
+            #if canImport(Darwin)
             let before = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             let client = Client.ready(fixture.server)
             defer { client.tearDown() }
             for id in 1...6 {
@@ -186,8 +207,10 @@ extension IndependentStdioTransportTests {
             #expect(client.stopped(within: 10))
             // Giving up is logged; an ordinary end is not.
             #expect(fixture.log.all == [], "\(fixture.log.all)")
+            #if canImport(Darwin)
             let rest = Set(independentStdioTransportThreads().map(\.id)).subtracting(before)
             #expect(threadsGone(rest, within: 5))
+            #endif
             #expect(client.violations == [])
         }
 
@@ -197,7 +220,9 @@ extension IndependentStdioTransportTests {
             let step = 8 * 1024
             let pause: useconds_t = 50_000
             let fixture = try independentStdioFixture { $0.outputDrainSeconds = limit }
+            #if canImport(Darwin)
             let before = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             let client = Client(fixture.server)
             defer { client.tearDown() }
             if nonBlocking { independentStdioSetNonBlocking(client.serverOutput) }
@@ -227,8 +252,10 @@ extension IndependentStdioTransportTests {
             let rest = client.responses(to: Set(1...3).subtracting(answers.keys), timeout: 30)
             #expect(answers.count + rest.count == 3)
             #expect(client.stopped(within: 10))
+            #if canImport(Darwin)
             let left = Set(independentStdioTransportThreads().map(\.id)).subtracting(before)
             #expect(threadsGone(left, within: 5))
+            #endif
             #expect(client.violations == [])
         }
 
@@ -260,7 +287,9 @@ extension IndependentStdioTransportTests {
         @Test(arguments: [false, true])
         func aPauseUnderTheLimitIsWaitedOutAndAPauseOverItIsNot(socket: Bool) throws {
             let fixture = try independentStdioFixture { $0.outputDrainSeconds = 2 }
+            #if canImport(Darwin)
             let before = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             let client = Client.ready(fixture.server, channel: socket ? .socketpair : .pipes)
             defer { client.tearDown() }
             for id in 1...6 {
@@ -290,8 +319,10 @@ extension IndependentStdioTransportTests {
             for (id, answer) in answers {
                 #expect(Client.text(of: answer) == independentStdioBlob(size: 600_000, seed: id), "blob \(id)")
             }
+            #if canImport(Darwin)
             let left = Set(independentStdioTransportThreads().map(\.id)).subtracting(before)
             #expect(threadsGone(left, within: 5))
+            #endif
             #expect(client.violations == [])
         }
 
@@ -383,17 +414,19 @@ extension IndependentStdioTransportTests {
             let fixture = try independentStdioFixture()
             let client = Client(fixture.server)
             defer { client.tearDown() }
+            #if canImport(Darwin)
             let threads = independentStdioTransportThreads().count
+            #endif
             let descriptors = independentStdioOpenDescriptorCount()
             // No descriptor number is left: lower the limit to just above the highest one in
             // use and fill every gap below it.
             var limit = rlimit()
-            try #require(getrlimit(RLIMIT_NOFILE, &limit) == 0)
+            try #require(getrlimit(openFilesResource, &limit) == 0)
             let original = limit
             var highest: Int32 = 0
             for descriptor in 0..<Int32(Swift.min(Int(getdtablesize()), 65536)) where fcntl(descriptor, F_GETFD) != -1 { highest = descriptor }
             limit.rlim_cur = rlim_t(highest + 1)
-            try #require(setrlimit(RLIMIT_NOFILE, &limit) == 0)
+            try #require(setrlimit(openFilesResource, &limit) == 0)
             var fillers: [Int32] = []
             while true {
                 let filler = dup(client.serverInput)
@@ -404,11 +437,13 @@ extension IndependentStdioTransportTests {
             let returned = client.stopped(within: 10)
             for filler in fillers { close(filler) }
             var restored = original
-            #expect(setrlimit(RLIMIT_NOFILE, &restored) == 0)
+            #expect(setrlimit(openFilesResource, &restored) == 0)
             #expect(returned, "run did not return although it could not start")
             #expect(fixture.log.all.count == 1, "\(fixture.log.all)")
             #expect(fixture.log.all.first?.contains("wake-up pipe") == true)
+            #if canImport(Darwin)
             #expect(independentStdioTransportThreads().count == threads)
+            #endif
             #expect(independentStdioOpenDescriptorCount() == descriptors)
             #expect(client.drain(seconds: 0.2).isEmpty)
             // The server is none the worse for it.
@@ -453,6 +488,7 @@ extension IndependentStdioTransportTests {
 
         // MARK: The writer left behind
 
+        #if canImport(Darwin)
         /// "The writer thread stays blocked in `write` until the peer reads or goes away."
         @Test(arguments: [false, true], [false, true])
         func theWriterLeftBehindEndsWhenThePeerGoesAwayOrReads(socket: Bool, nonBlocking: Bool) throws {
@@ -474,7 +510,9 @@ extension IndependentStdioTransportTests {
             #expect(second.client.violations == [])
             second.client.tearDown()
         }
+        #endif
 
+        #if canImport(Darwin)
         /// Many sessions in a row whose clients never read. While the clients are still there,
         /// one thread per session stays (that is the documented price); the wake-up pipes are
         /// closed all the same. Once the clients go, nothing is left.
@@ -506,7 +544,9 @@ extension IndependentStdioTransportTests {
             #expect(after.descriptors <= descriptors + 6, "open descriptors: \(descriptors) before, \(after.descriptors) after")
             #expect(after.threads <= threads + 2, "transport threads: \(threads) before, \(after.threads) after")
         }
+        #endif
 
+        #if canImport(Darwin)
         @Test(arguments: [false, true], [false, true])
         func theWriterLeftBehindNeverTouchesADescriptorTheCallerReused(socket: Bool, nonBlocking: Bool) throws {
             independentStdioCountSIGUSR1()
@@ -546,6 +586,7 @@ extension IndependentStdioTransportTests {
             if !socket { close(abandoned.client.serverInput) }
             abandoned.client.tearDown()
         }
+        #endif
 
         @Test func aSessionOpensThreeDescriptorsAllCloseOnExecAndReturnsThem() throws {
             let fixture = try independentStdioFixture()
@@ -581,6 +622,7 @@ extension IndependentStdioTransportTests {
             #expect(inherited == [], "\(inherited.count) of the session's descriptors are not close-on-exec")
         }
 
+        #if canImport(Darwin)
         /// Two hundred sessions in a row on one server, every eighth with a client that never
         /// reads (its writer is left behind). After each `run` the caller hands the output's
         /// number straight to a pipe of its own, as a server that accepts connections would. The
@@ -672,6 +714,7 @@ extension IndependentStdioTransportTests {
             #expect(after.descriptors <= descriptors + 6, "open descriptors: \(descriptors) before, \(after.descriptors) after")
             #expect(after.threads.count <= 2, "transport threads left: \(after.threads.map(\.name))")
         }
+        #endif
 
         /// The fallback: "If the descriptor cannot be duplicated (already closed …) the session
         /// uses the caller's number and the first failed write ends it." With -1 there is
@@ -711,14 +754,16 @@ extension IndependentStdioTransportTests {
             var script = Client.requestLine(0, "initialize", #"{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"independent","version":"1"}}"#)
             script += Client.requestLine(1, "ping")
             #expect(client.send(script, absorb: false))
+            #if canImport(Darwin)
             let threads = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             var limit = rlimit()
-            try #require(getrlimit(RLIMIT_NOFILE, &limit) == 0)
+            try #require(getrlimit(openFilesResource, &limit) == 0)
             let original = limit
             var highest: Int32 = 0
             for descriptor in 0..<Int32(Swift.min(Int(getdtablesize()), 65536)) where fcntl(descriptor, F_GETFD) != -1 { highest = descriptor }
             limit.rlim_cur = rlim_t(highest + 3)
-            try #require(setrlimit(RLIMIT_NOFILE, &limit) == 0)
+            try #require(setrlimit(openFilesResource, &limit) == 0)
             var fillers: [Int32] = []
             while true {
                 let filler = dup(client.serverInput)
@@ -733,11 +778,13 @@ extension IndependentStdioTransportTests {
             let descriptorsAfter = independentStdioOpenDescriptorCount()
             for filler in fillers { close(filler) }
             var restored = original
-            #expect(setrlimit(RLIMIT_NOFILE, &restored) == 0)
+            #expect(setrlimit(openFilesResource, &restored) == 0)
             #expect(returned, "run did not return although it could not duplicate the output")
             #expect(fixture.log.all.count == 1 && fixture.log.all.first?.contains("could not duplicate") == true, "\(fixture.log.all)")
             #expect(descriptorsAfter == descriptors, "descriptors: \(descriptors) before, \(descriptorsAfter) after")
+            #if canImport(Darwin)
             #expect(Set(independentStdioTransportThreads().map(\.id)).subtracting(threads).isEmpty, "a transport thread was left behind")
+            #endif
             #expect(client.drain(seconds: 0.3).isEmpty, "something was written")
             #expect(fcntl(client.serverOutput, F_GETFD) != -1, "the caller's output was closed")
         }
@@ -760,7 +807,9 @@ extension IndependentStdioTransportTests {
         @Test(arguments: [IndependentStdioClient.Channel.pipes, .socketpair], [false, true])
         func aPeerThatLeavesInTheMiddleOfAFrameEndsTheSession(channel: IndependentStdioClient.Channel, nonBlocking: Bool) throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 30 }
+            #if canImport(Darwin)
             let before = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             let client = Client(fixture.server, channel: channel)
             defer {
                 fixture.probe.release()
@@ -769,7 +818,9 @@ extension IndependentStdioTransportTests {
             if nonBlocking { independentStdioSetNonBlocking(client.serverOutput) }
             client.start()
             #expect(client.initialize() == "2025-11-25")
+            #if canImport(Darwin)
             let threads = Set(independentStdioSessionThreads(startedAfter: before).map(\.id))
+            #endif
             #expect(client.call(1, "hold", #"{"tag":"bystander"}"#))
             #expect(client.call(2, "blob", #"{"size":3000000,"seed":2}"#))
             #expect(fixture.probe.eventually(seconds: 10) { $0.startedTags.contains("bystander") && $0.finishedTags.contains("blob-2") })

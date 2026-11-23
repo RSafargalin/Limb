@@ -1,5 +1,9 @@
 #if canImport(Darwin)
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import LimbCore
 import Testing
 
