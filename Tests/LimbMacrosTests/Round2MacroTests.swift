@@ -480,9 +480,15 @@ private func round2ExtremeNumbersOnTheWire() async -> [String] {
         }
         // As a progress token, and as a value in `_meta`.
         _ = client.post("tools/call", ["name": "r2_m_progress"], meta: ["progressToken": .number(number), "x": [.number(number)]])
-        let progress = await next()
-        check("progress", progress) { $0?["method"] == "notifications/progress" && $0?["params"]?["progressToken"]?.numberValue == seen }
-        if !foundationRefuses {
+        if foundationRefuses {
+            if !isParseError(await next()) { problems.append("progress \(text): expected a parse error") }
+        } else {
+            if seen.isInteger {
+                let progress = await next()
+                if progress?["method"] != "notifications/progress" || progress?["params"]?["progressToken"]?.numberValue != seen {
+                    problems.append("progress \(text): \(String(describing: progress))")
+                }
+            }
             let done = await next()
             if done?["result"]?["isError"] != false { problems.append("progress \(text), response: \(String(describing: done))") }
         }
