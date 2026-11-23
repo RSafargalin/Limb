@@ -7,6 +7,7 @@ import Musl
 #endif
 #if os(Linux)
 import CLimbStack
+import CDispatch
 #endif
 
 /// Measures how much stack a recursive algorithm has used since it started.

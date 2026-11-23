@@ -9,6 +9,9 @@ import Glibc
 #elseif canImport(Musl)
 import Musl
 #endif
+#if os(Linux)
+import CDispatch
+#endif
 
 /// Newline-delimited JSON-RPC over a pair of file descriptors: stdin and stdout by default,
 /// or any stream (a Unix socket, a TCP connection) that uses the same framing.
