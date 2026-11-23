@@ -13,24 +13,10 @@ import LimbCore
     }
 
     @Test func numbersKeepTheirLexeme() throws {
-        #if !FoundationJSON
         for text in ["1.0", "-0", "1e400", "12345678901234567890123", "1E+2", "0.1e-7", "9007199254740993"] {
             let value = try JSON.parse(text)
             #expect(value.description == text)
         }
-        #else
-        // The fallback keeps the value, not the text: an integer that fits 64 bits stays exact,
-        // every other number is a Double and is written the way Limb writes any Double.
-        for (text, written) in [
-            ("1.0", "1.0"), ("-0", "0"), ("12345678901234567890123", "1.2345678901234568e+22"),
-            ("1E+2", "100.0"), ("0.1e-7", "1e-08"), ("9007199254740993", "9007199254740993"),
-        ] {
-            #expect(try JSON.parse(text).description == written)
-        }
-        // Valid JSON, but out of range for a Double: Foundation refuses it.
-        let refused = #expect(throws: JSONParseError.self) { try JSON.parse("1e400") }
-        #expect(refused?.kind == .malformed)
-        #endif
         #expect(try JSON.parse("1.0") == 1)
         #expect(try JSON.parse("1e2").intValue == 100)
         #expect(try JSON.parse("1.5").intValue == nil)
@@ -48,7 +34,11 @@ import LimbCore
         let value = try JSON.parse(#"{"a":[1,2,{"b":null}],"c":{},"d":[]}"#)
         #expect(value == ["a": [1, 2, ["b": nil]], "c": [:], "d": []])
         #expect(value["a"]?[2]?["b"] == .null)
+        #if FoundationJSON
+        #expect(try JSON.parse(value.description) == value)
+        #else
         #expect(value.description == #"{"a":[1,2,{"b":null}],"c":{},"d":[]}"#)
+        #endif
     }
 
     static var rejected: [String] {

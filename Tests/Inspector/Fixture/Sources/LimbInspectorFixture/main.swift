@@ -68,9 +68,7 @@ let argument = CommandLine.arguments[1]
 if argument == "--protocol-versions" {
     for version in ProtocolVersion.all { print(version.rawValue) }
 } else if argument == "--codec" {
-    // The codecs both accept this value but emit different number lexemes.
-    let number = try JSON.parse("1e2")
-    print(number.description == "100.0" ? "FoundationJSON" : "default")
+    print(JSON.codec == .foundation ? "FoundationJSON" : "default")
 } else {
     let version = ProtocolVersion(rawValue: argument)
     guard ProtocolVersion.all.contains(version) else { throw FixtureError.expectedProtocolVersion }

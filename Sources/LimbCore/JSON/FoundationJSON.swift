@@ -7,8 +7,8 @@ import Foundation
 enum FoundationJSON {
     /// Parses with `JSONSerialization` and converts the result to `JSONValue`.
     ///
-    /// Everything that could make Foundation crash or silently change the data is refused before
-    /// Foundation sees the input (`precheck`). `maxNodes` is applied while converting, that is
+    /// The input scan checks nesting and protects number text before Foundation sees it.
+    /// `maxNodes` is applied while converting, that is
     /// after Foundation has already built its own tree: it bounds what Limb keeps, not what
     /// Foundation allocates. `rejectDuplicateKeys` cannot be honoured — Foundation keeps one of
     /// the duplicates silently.
@@ -16,18 +16,18 @@ enum FoundationJSON {
         let stack = StackGuard.remaining
         let ceiling = stack == nil ? blindDepthCeiling : depthCeiling
         let limit = min(options.maxDepth, ceiling)
-        let deepest = try precheck(bytes, maxDepth: limit)
-        if let stack, deepest * stackPerLevel + stackReserve > stack {
+        let prepared = try prepare(bytes, maxDepth: limit)
+        if let stack, prepared.deepest * stackPerLevel + stackReserve > stack {
             throw JSONParseError(kind: .depthLimitExceeded(limit), offset: 0)
         }
-        let data = bytes.withUnsafeBufferPointer { unsafe Data(buffer: $0) }
+        let data = Data(prepared.bytes)
         let object: Any
         do {
             object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
         } catch {
             throw JSONParseError(kind: .malformed, offset: 0)
         }
-        var conversion = Conversion(options: options)
+        var conversion = Conversion(options: options, protectedStrings: prepared.strings)
         return try conversion.convert(object)
     }
 
@@ -43,54 +43,99 @@ enum FoundationJSON {
     static let stackPerLevel = 2048
     static let stackReserve = 32 * 1024
 
-    /// Refuses input Foundation must not see and returns the deepest nesting found.
-    ///
-    /// This is a scan for brackets outside strings, not a parser. It follows the same rule for
-    /// where a string ends as any JSON lexer, so on the prefix Foundation reads before its first
-    /// error the two agree on depth.
-    ///
-    /// Refused:
-    /// - zero bytes: Foundation sniffs UTF-16 and UTF-32, and a UTF-8 JSON text never has one;
-    /// - a byte order mark before the text: Foundation skips it, RFC 8259 forbids sending it;
-    /// - a string that starts with U+FEFF, raw or escaped: Foundation drops that character, so
-    ///   `"\uFEFFa"` would come back as `"a"` and two different keys would become one. The
-    ///   text is valid JSON; it is refused because this codec cannot return it unchanged;
-    /// - nesting beyond `maxDepth`.
-    private static func precheck(_ bytes: Span<UInt8>, maxDepth: Int) throws(JSONParseError) -> Int {
-        var depth = 0
+    private struct Prepared {
+        var bytes: [UInt8] = []
+        var strings: [String] = []
         var deepest = 0
-        var inString = false
-        var index = 0
-        let count = bytes.count
-        if startsWithByteOrderMark(bytes, at: 0) {
+    }
+
+    /// Tags strings and numbers before Foundation's structural parse. Object keys use ASCII
+    /// handles so bridging through Swift dictionaries preserves byte-distinct names. Strings
+    /// containing an interior U+FEFF use handles too because Foundation may drop that scalar.
+    private static func prepare(_ bytes: Span<UInt8>, maxDepth: Int) throws(JSONParseError) -> Prepared {
+        guard !startsWithByteOrderMark(bytes, at: 0) else {
             throw JSONParseError(kind: .unexpectedByte(0xEF), offset: 0)
         }
-        while index < count {
+        var prepared = Prepared()
+        prepared.bytes.reserveCapacity(bytes.count)
+        var keys: [ExactString: Int] = [:]
+        var depth = 0
+        var index = 0
+        while index < bytes.count {
             let byte = bytes[index]
             if byte == 0 { throw JSONParseError(kind: .unexpectedByte(0), offset: index) }
-            if inString {
-                if byte == 0x5C {
-                    index += 1
-                } else if byte == 0x22 {
-                    inString = false
+            if byte == 0x22 {
+                let start = index
+                guard !startsWithByteOrderMark(bytes, at: start + 1) else {
+                    throw JSONParseError(kind: .malformed, offset: start)
                 }
-            } else if byte == 0x22 {
-                inString = true
-                if startsWithByteOrderMark(bytes, at: index + 1) {
-                    throw JSONParseError(kind: .malformed, offset: index)
+                var hasInnerBOM = false
+                index += 1
+                while index < bytes.count, bytes[index] != 0x22 {
+                    if bytes[index] == 0 { throw JSONParseError(kind: .unexpectedByte(0), offset: index) }
+                    if !hasInnerBOM, bytes[index] == 0xEF || bytes[index] == 0x5C {
+                        hasInnerBOM = startsWithByteOrderMark(bytes, at: index)
+                    }
+                    index += bytes[index] == 0x5C ? 2 : 1
                 }
-            } else if byte == 0x5B || byte == 0x7B {
-                depth += 1
-                if depth > maxDepth {
-                    throw JSONParseError(kind: .depthLimitExceeded(maxDepth), offset: index)
+                guard index < bytes.count else { throw JSONParseError(kind: .malformed, offset: 0) }
+                let closing = index
+                index += 1
+
+                var next = index
+                while next < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[next]) { next += 1 }
+                let isKey = next < bytes.count && bytes[next] == 0x3A
+                prepared.bytes.append(0x22)
+                if isKey || hasInnerBOM {
+                    guard let decoded = try? JSON.parseValidated(bytes.extracting(start..<index), options: .default),
+                        let string = decoded.stringValue else { throw JSONParseError(kind: .malformed, offset: 0) }
+
+                    let key = ExactString(string)
+                    let position: Int
+                    if isKey, let existing = keys[key] {
+                        position = existing
+                    } else {
+                        position = prepared.strings.count
+                        prepared.strings.append(string)
+                        if isKey { keys[key] = position }
+                    }
+                    prepared.bytes.append(isKey ? 0x6B : 0x76) // key or protected value.
+                    prepared.bytes.append(contentsOf: String(position).utf8)
+                } else {
+                    prepared.bytes.append(0x73) // Unprotected string.
+                    bytes.extracting((start + 1)..<closing).withUnsafeBufferPointer { pointer in
+                        unsafe prepared.bytes.append(contentsOf: pointer)
+                    }
                 }
-                if depth > deepest { deepest = depth }
-            } else if byte == 0x5D || byte == 0x7D {
-                if depth > 0 { depth -= 1 }
+                prepared.bytes.append(0x22)
+            } else if byte == 0x2D || (0x30...0x39).contains(byte) {
+                let start = index
+                do {
+                    _ = try parseNumber(bytes, &index)
+                } catch {
+                    throw JSONParseError(kind: .malformed, offset: 0)
+                }
+                prepared.bytes.append(0x22)
+                prepared.bytes.append(0x6E) // Exact number text.
+                bytes.extracting(start..<index).withUnsafeBufferPointer { pointer in
+                    unsafe prepared.bytes.append(contentsOf: pointer)
+                }
+                prepared.bytes.append(0x22)
+            } else {
+                prepared.bytes.append(byte)
+                if byte == 0x5B || byte == 0x7B {
+                    depth += 1
+                    if depth > maxDepth {
+                        throw JSONParseError(kind: .depthLimitExceeded(maxDepth), offset: index)
+                    }
+                    prepared.deepest = max(depth, prepared.deepest)
+                } else if (byte == 0x5D || byte == 0x7D), depth > 0 {
+                    depth -= 1
+                }
+                index += 1
             }
-            index += 1
         }
-        return deepest
+        return prepared
     }
 
     /// Whether U+FEFF starts at `index`, as the bytes `EF BB BF` or as the escape `\uFEFF`.
@@ -120,9 +165,7 @@ enum FoundationJSON {
     private struct Conversion {
         let options: JSONParseOptions
         var nodes = 0
-        /// `true` and `false` come back as a private subclass of `NSNumber`; its class is the only
-        /// thing that tells them from the numbers 1 and 0.
-        let booleanClass: AnyClass = type(of: NSNumber(value: true))
+        let protectedStrings: [String]
 
         /// A container that is being filled.
         private struct Frame {
@@ -147,9 +190,23 @@ enum FoundationJSON {
                 }
                 var value: JSONValue
                 if let string = pending as? String {
-                    value = .string(string)
+                    let text = String(decoding: string.utf8.dropFirst(), as: UTF8.self)
+                    switch string.utf8.first {
+                    case 0x73:
+                        value = .string(text)
+                    case 0x6E:
+                        value = .number(JSONNumber(validatedLexeme: text))
+                    case 0x76:
+                        guard let position = Int(text), protectedStrings.indices.contains(position) else {
+                            throw JSONParseError(kind: .malformed, offset: 0)
+                        }
+                        value = .string(protectedStrings[position])
+                    default:
+                        throw JSONParseError(kind: .malformed, offset: 0)
+                    }
                 } else if let number = pending as? NSNumber {
-                    value = try convert(number)
+                    // All JSON numbers were tagged as strings before the Foundation parse.
+                    value = .bool(number.boolValue)
                 } else if pending is NSNull {
                     value = .null
                 } else if let array = pending as? NSArray {
@@ -209,10 +266,12 @@ enum FoundationJSON {
         }
 
         private func member(of dictionary: NSDictionary, named key: Any) throws(JSONParseError) -> (String, Any) {
-            guard let name = key as? String, let value = dictionary.object(forKey: key) else {
+            guard let name = key as? String, name.utf8.first == 0x6B,
+                let position = Int(name.dropFirst()), protectedStrings.indices.contains(position),
+                let value = dictionary.object(forKey: key) else {
                 throw JSONParseError(kind: .malformed, offset: 0)
             }
-            return (name, value)
+            return (protectedStrings[position], value)
         }
 
         private func descend(_ depth: Int) throws(JSONParseError) {
@@ -221,35 +280,6 @@ enum FoundationJSON {
             }
         }
 
-        /// Integers that fit `Int64` or `UInt64` are exact; every other number is a `Double`.
-        ///
-        /// Foundation returns an `NSDecimalNumber` for numbers a `Double` cannot hold exactly, and
-        /// its text looks exact — but it keeps 38 digits and drops the rest without a trace, so
-        /// a 39-digit integer comes back as a different integer. Nothing in the result tells a
-        /// truncated value from a whole one, so the text is never trusted: such a number becomes
-        /// a `Double`, which is at least visibly approximate when written back.
-        private func convert(_ number: NSNumber) throws(JSONParseError) -> JSONValue {
-            if type(of: number) == booleanClass { return .bool(number.boolValue) }
-            if !(number is NSDecimalNumber) {
-                switch unsafe number.objCType.pointee {
-                case 0x64, 0x66:  // 'd', 'f'
-                    break
-                case 0x51:  // 'Q': above Int64.max the text is the only exact form
-                    let value = number.uint64Value
-                    if let small = Int64(exactly: value) { return .number(JSONNumber(small)) }
-                    if let exact = JSONNumber(lexeme: String(value)) { return .number(exact) }
-                default:
-                    return .number(JSONNumber(number.int64Value))
-                }
-            }
-            // `NSDecimalNumber.doubleValue` is not correctly rounded (`1e30` written out in full
-            // comes back as 9.999999999999999e+29), so the decimal's text is read by Swift instead.
-            let double = number is NSDecimalNumber ? Double(number.stringValue) ?? number.doubleValue : number.doubleValue
-            guard let value = JSONNumber(double) else {
-                throw JSONParseError(kind: .invalidNumber, offset: 0)
-            }
-            return .number(value)
-        }
     }
 }
 #endif
