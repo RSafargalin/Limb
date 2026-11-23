@@ -165,7 +165,7 @@ import LimbCore
 
     @Test func refusesWhatItCannotEnforce() {
         #expect(throws: JSONSchemaError.self) { try JSONSchema(["$ref": "https://example.com/schema.json"]) }
-        #expect(throws: JSONSchemaError.self) { try JSONSchema(["unevaluatedProperties": false]) }
+        #expect(throws: JSONSchemaError.self) { try JSONSchema(["unevaluatedProperties": "invalid"]) }
         #expect(throws: JSONSchemaError.self) { try JSONSchema(["$dynamicRef": "#x"]) }
         #expect(throws: JSONSchemaError.self) { try JSONSchema(["$schema": "https://json-schema.org/draft/2019-09/schema"]) }
         #expect(throws: JSONSchemaError.self) { try JSONSchema(["type": "strnig"]) }

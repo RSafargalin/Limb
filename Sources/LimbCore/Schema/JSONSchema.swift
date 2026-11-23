@@ -1,3 +1,5 @@
+import Foundation
+
 /// A schema could not be compiled: it is malformed, uses an unsupported dialect or keyword,
 /// references something outside itself, or exceeds the resource bounds.
 public struct JSONSchemaError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -23,29 +25,28 @@ public struct SchemaViolation: Error, Sendable, Equatable, CustomStringConvertib
 ///
 /// Compilation happens once, when a tool is registered; validation walks the compiled form.
 /// Per the MCP specification:
-/// - a `$ref` is resolved only inside the schema document, and only to a location that is a
-///   schema (`#/$defs/a`, `#/properties/b`, not `#/enum/0`), spelled as a well-formed JSON
-///   pointer fragment; anything that would require a network fetch is rejected at compile time
-///   rather than treated as permissive;
+/// - References resolve to schema locations in the document, embedded resources, and the
+///   documents explicitly registered by URI. An unresolved reference fails compilation.
+///   URI resolution performs no network fetches.
 /// - composition is bounded (`Limits`): schema depth, number of subschemas and validation
 ///   recursion are limited, and one `validate` call takes at most `maxEvaluations` subschema
-///   evaluations and `maxPatternSteps` pattern steps (twice that if the first attempt runs out
+///   evaluations and value visits for comparisons, plus `maxPatternSteps` pattern steps (twice that if the first attempt runs out
 ///   of stack and is repeated on a large one). Together these bound the time of a call
 ///   whatever the schema and the instance: with the defaults, under a second in an optimized
 ///   build, two at most when the stack runs out. A call that would need more fails with a message that says so; it never
 ///   passes a value it could not finish checking.
 ///
 /// What the validator cannot enforce exactly, it refuses to compile, so nothing is silently
-/// unchecked: the keywords `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`,
-/// `$dynamicAnchor`, `$anchor`, `$recursiveRef` and `$recursiveAnchor`; `additionalItems`
-/// outside draft-07; `$id` and `$schema` anywhere but at the root (they would change how
-/// references inside resolve); a keyword whose value has the wrong type (`"uniqueItems": "true"`,
+/// unchecked: the legacy 2019-09 keywords `$recursiveRef` and `$recursiveAnchor`;
+/// `additionalItems` outside draft-07; `$schema` outside a schema resource root;
+/// a keyword whose value has the wrong type (`"uniqueItems": "true"`,
 /// an empty `type` list, array-form `items` outside draft-07); and patterns outside the dialect
 /// below. Definitions under `$defs` and `definitions`, and `then` / `else` without `if`, are
 /// compiled and checked even when nothing uses them. `format` is an annotation, as 2020-12
 /// specifies by default.
 ///
-/// Numbers are compared exactly, as the decimals their text spells (see `JSONNumber`):
+/// Numbers used in schema comparisons need a normalized decimal exponent in −10¹⁸…10¹⁸.
+/// Within that range they are compared exactly, as the decimals their text spells:
 /// `"minimum": 9007199254740993` rejects 9007199254740992, and `multipleOf` is an exact
 /// remainder (its value may have at most 19 significant digits).
 ///
@@ -76,7 +77,8 @@ public struct JSONSchema: Sendable {
         /// the answer depend on the build: a run that runs out of stack is repeated on a thread
         /// with a large one.
         public var maxValidationRecursion = 4096
-        /// Subschema evaluations in one `validate` call. A schema whose alternatives refer to
+        /// Subschema evaluations and values visited for structural comparisons in one `validate` call.
+        /// A schema whose alternatives refer to
         /// each other can take time exponential in its size; past this many steps the value is
         /// reported as not checkable rather than checked for as long as it takes. In an
         /// optimized build ten million steps take about half a second. A message the server
@@ -108,26 +110,26 @@ public struct JSONSchema: Sendable {
     let nodes: [Node]
     let root: Int
     let limits: Limits
+    private let dynamicAnchors: [ExactString: [ExactString: Int]]
 
     public init(_ schema: JSONValue, limits: Limits = Limits()) throws(JSONSchemaError) {
-        if case .object(let object) = schema {
-            if let dialect = object["$schema"] {
-                guard let uri = dialect.stringValue, JSONSchema.supportedDialects.contains(uri) else {
-                    throw JSONSchemaError(reason: "unsupported JSON Schema dialect \(dialect)", pointer: "/$schema")
-                }
-            }
-            if let identifier = object["$id"], identifier.stringValue == nil {
-                throw JSONSchemaError(reason: "\"$id\" must be a string", pointer: "/$id")
-            }
-        }
-        let isDraft7 = schema["$schema"]?.stringValue?.contains("draft-07") ?? false
+        try self.init(schema, registeredSchemas: [:], limits: limits)
+    }
+
+    /// Compiles against schema documents supplied in memory at absolute retrieval URIs.
+    public init(
+        _ schema: JSONValue, registeredSchemas: [String: JSONValue], limits: Limits = Limits()
+    ) throws(JSONSchemaError) {
+        let isDraft7 = schema["$schema"]?.stringValue.map { JSONSchema.supportedDialects.contains($0) && $0.contains("draft-07") } ?? false
         // Compilation recurses once per level of the schema. A schema within `maxDepth` can
         // still need more stack than an unoptimized build leaves a handler, and whether it
         // compiles must not depend on the build: such a run is repeated on a large stack.
-        var outcome = Compiler.run(schema, isDraft7: isDraft7, limits: limits, stack: StackGuard())
+        var outcome = Compiler.run(schema, registeredSchemas, isDraft7: isDraft7, limits: limits, stack: StackGuard())
         if outcome.exhausted {
             outcome = onLargeStack(bytes: JSONSchema.largeStackBytes) {
-                Compiler.run(schema, isDraft7: isDraft7, limits: limits, stack: StackGuard(budget: JSONSchema.largeStackBytes - (1 << 20)))
+                Compiler.run(
+                    schema, registeredSchemas, isDraft7: isDraft7, limits: limits,
+                    stack: StackGuard(budget: JSONSchema.largeStackBytes - (1 << 20)))
             }
             if outcome.exhausted {
                 throw JSONSchemaError(reason: "the schema is nested too deeply to compile", pointer: "")
@@ -136,6 +138,7 @@ public struct JSONSchema: Sendable {
         let compiled = try outcome.result.get()
         root = compiled.root
         nodes = compiled.nodes
+        dynamicAnchors = compiled.dynamicAnchors
         self.limits = limits
     }
 
@@ -177,12 +180,14 @@ public struct JSONSchema: Sendable {
         if run.isOverPatternBudget {
             return fail("matching patterns against this value takes more than \(limits.maxPatternSteps) steps")
         }
+        if run.comparedUnsupportedNumber { return fail(Self.exponentRangeError) }
         if let cut = run.cut { return fail(cut) }
         violation?.path.reverse()
         return violation
     }
 
     static let largeStackBytes = 64 << 20
+    static let exponentRangeError = "number has a normalized exponent outside the exact decimal range"
 }
 
 /// The state of one validation run, shared by every level of it.
@@ -194,6 +199,8 @@ final class Evaluation {
     private var patternScratch = PatternScratch()
     private(set) var isOverBudget = false
     private(set) var isOverPatternBudget = false
+    private(set) var comparedUnsupportedNumber = false
+    var dynamicScope: [ExactString] = []
     /// How many keywords that can turn a failure into a success (`not`, `oneOf`, `if`, and
     /// `contains` with a maximum) enclose the subschema being checked.
     var inversions = 0
@@ -209,12 +216,51 @@ final class Evaluation {
 
     /// Takes one step; `false` once the budget is spent.
     func step() -> Bool {
-        guard remaining > 0 else {
+        charge(1)
+    }
+
+    func charge(_ steps: Int) -> Bool {
+        guard remaining >= steps else {
             isOverBudget = true
             return false
         }
-        remaining -= 1
+        remaining -= steps
         return true
+    }
+
+    func accepts(_ number: JSONNumber) -> Bool {
+        guard number.isWithinExactDecimalRange else {
+            comparedUnsupportedNumber = true
+            return false
+        }
+        return true
+    }
+
+    /// Compare only the value pairs examined, stopping as soon as one differs.
+    func equal(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
+        guard step(), !stack.isExhausted else { return false }
+        switch (lhs, rhs) {
+        case (.array(let left), .array(let right)):
+            guard left.count == right.count else { return false }
+            return zip(left, right).allSatisfy { equal($0.0, $0.1) }
+        case (.object(let left), .object(let right)):
+            guard left.count == right.count else { return false }
+            return left.allSatisfy { entry in right[entry.key].map { equal(entry.value, $0) } ?? false }
+        case (.number(let left), .number(let right)):
+            return accepts(left) && accepts(right) && left == right
+        default: return lhs == rhs
+        }
+    }
+
+    /// Hashing a value for `uniqueItems` visits every member, even if the set is empty.
+    func chargeHash(of value: JSONValue) -> Bool {
+        guard step(), !stack.isExhausted else { return false }
+        switch value {
+        case .array(let values): return values.allSatisfy(chargeHash)
+        case .object(let object): return object.allSatisfy { chargeHash(of: $0.value) }
+        case .number(let number): return accepts(number)
+        default: return true
+        }
     }
 
     /// Whether `pattern` matches `string`; `nil` once the pattern budget is spent.
@@ -240,6 +286,19 @@ final class Evaluation {
         inversions += 1
         defer { inversions -= 1 }
         return body()
+    }
+}
+
+/// Annotations at a single instance location. Each successful subschema contributes its own
+/// set, so an unsuccessful alternative cannot mark properties or items as evaluated.
+private final class EvaluatedLocations {
+    var properties: Set<ExactString> = []
+    var items: Set<Int> = []
+
+    func merge(_ child: EvaluatedLocations, run: Evaluation) {
+        guard run.charge(child.properties.count + child.items.count) else { return }
+        properties.formUnion(child.properties)
+        items.formUnion(child.items)
     }
 }
 
@@ -287,6 +346,8 @@ struct TypeSet: OptionSet, Sendable {
 final class Node: @unchecked Sendable {
     var always: Bool?
     var ref: Int?
+    var dynamicRef: (fallback: Int, anchor: ExactString?)?
+    var resource: ExactString?
     var types: TypeSet?
     var enumeration: [JSONValue]?
     var const: JSONValue?
@@ -304,6 +365,7 @@ final class Node: @unchecked Sendable {
 
     var prefixItems: [Int] = []
     var items: Int?
+    var unevaluatedItems: Int?
     var contains: Int?
     var minContains: Int?
     var maxContains: Int?
@@ -311,9 +373,10 @@ final class Node: @unchecked Sendable {
     var maxItems: Int?
     var uniqueItems = false
 
-    var properties: [(name: String, node: Int)] = []
+    var properties: [ExactString: Int] = [:]
     var patternProperties: [(pattern: Pattern, node: Int)] = []
     var additionalProperties: Int?
+    var unevaluatedProperties: Int?
     var propertyNames: Int?
     var required: [String] = []
     var minProperties: Int?
@@ -333,7 +396,34 @@ final class Node: @unchecked Sendable {
 // MARK: - Compiler
 
 private struct Compiler {
+    private enum Vocabulary: String {
+        case core, applicator, unevaluated, validation, metadata = "meta-data", format = "format-annotation", content
+    }
+
+    private struct Dialect {
+        var isDraft7: Bool
+        // The built-in dialects have fixed keyword sets handled by the compiler.
+        var vocabularies: Set<Vocabulary>? = nil
+
+        func uses(_ keyword: String) -> Bool {
+            guard let vocabularies, let vocabulary = Compiler.keywordVocabulary[keyword] else { return true }
+            return vocabularies.contains(vocabulary)
+        }
+    }
+
+    private struct Location {
+        var schema: JSONValue
+        var resource: ExactString
+        var dialect: Dialect
+    }
+
+    private struct Anchor {
+        var pointer: String
+        var dynamic: Bool
+    }
+
     let document: JSONValue
+    let registeredSchemas: [String: JSONValue]
     let limits: JSONSchema.Limits
     /// In draft-07 a `$ref` replaces its sibling keywords; from 2019-09 on it is applied alongside them.
     let isDraft7: Bool
@@ -342,34 +432,208 @@ private struct Compiler {
     /// Pointer of an already compiled (or in-progress) subschema to its node, so recursive
     /// references terminate.
     var byPointer: [ExactString: Int] = [:]
+    private var locations: [ExactString: Location] = [:]
+    private var resources: [ExactString: String] = [:]
+    private var anchors: [ExactString: [ExactString: Anchor]] = [:]
+    private var neededResources: Set<ExactString> = []
+
+    struct Compiled {
+        var root: Int
+        var nodes: [Node]
+        var dynamicAnchors: [ExactString: [ExactString: Int]]
+    }
 
     /// Compiles a whole document. Whether it ran out of stack is reported apart from the
     /// result, which is not to be trusted then.
     static func run(
-        _ schema: JSONValue, isDraft7: Bool, limits: JSONSchema.Limits, stack: StackGuard
-    ) -> (result: Result<(root: Int, nodes: [Node]), JSONSchemaError>, exhausted: Bool) {
-        var compiler = Compiler(document: schema, limits: limits, isDraft7: isDraft7, stack: stack)
+        _ schema: JSONValue, _ registeredSchemas: [String: JSONValue], isDraft7: Bool, limits: JSONSchema.Limits, stack: StackGuard
+    ) -> (result: Result<Compiled, JSONSchemaError>, exhausted: Bool) {
+        var compiler = Compiler(document: schema, registeredSchemas: registeredSchemas, limits: limits, isDraft7: isDraft7, stack: stack)
         do throws(JSONSchemaError) {
+            try compiler.indexLocations()
             let root = try compiler.compile(schema, pointer: "", depth: 0)
-            return (.success((root, compiler.nodes)), stack.wasExhausted)
+            while let resource = compiler.neededResources.popFirst() {
+                guard let pointer = compiler.resources[resource], compiler.byPointer[ExactString(pointer)] == nil,
+                    let location = compiler.locations[ExactString(pointer)] else { continue }
+                _ = try compiler.compile(location.schema, pointer: pointer, depth: 0)
+            }
+            let dynamicAnchors = compiler.anchors.compactMapValues { named -> [ExactString: Int]? in
+                let compiled = named.compactMapValues { $0.dynamic ? compiler.byPointer[ExactString($0.pointer)] : nil }
+                return compiled.isEmpty ? nil : compiled
+            }
+            return (.success(Compiled(root: root, nodes: compiler.nodes, dynamicAnchors: dynamicAnchors)), stack.wasExhausted)
         } catch {
             return (.failure(error), stack.wasExhausted)
         }
     }
 
-    static let unsupported = [
-        "unevaluatedProperties", "unevaluatedItems", "$dynamicRef", "$dynamicAnchor", "$anchor", "$recursiveRef",
-        "$recursiveAnchor",
-    ]
-
     /// Keywords whose value is one schema.
     static let schemaKeywords: Set<String> = [
         "items", "additionalItems", "contains", "additionalProperties", "propertyNames", "not", "if", "then", "else",
+        "unevaluatedItems", "unevaluatedProperties",
     ]
     /// Keywords whose value is an object of schemas.
     static let schemaMapKeywords: Set<String> = ["properties", "patternProperties", "dependentSchemas", "$defs", "definitions"]
     /// Keywords whose value is an array of schemas.
     static let schemaListKeywords: Set<String> = ["allOf", "anyOf", "oneOf", "prefixItems"]
+
+    private static let vocabularyBase = "https://json-schema.org/draft/2020-12/vocab/"
+
+    private static let keywordVocabulary: [String: Vocabulary] = {
+        let groups: [(Vocabulary, [String])] = [
+            (.applicator, ["prefixItems", "items", "contains", "additionalProperties", "properties", "patternProperties",
+                "dependentSchemas", "propertyNames", "if", "then", "else", "allOf", "anyOf", "oneOf", "not"]),
+            (.unevaluated, ["unevaluatedItems", "unevaluatedProperties"]),
+            (.validation, ["type", "enum", "const", "multipleOf", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+                "minLength", "maxLength", "pattern", "maxItems", "minItems", "uniqueItems", "minContains", "maxContains",
+                "minProperties", "maxProperties", "required", "dependentRequired"]),
+            (.metadata, ["title", "description", "default", "deprecated", "readOnly", "writeOnly", "examples"]),
+            (.format, ["format"]),
+            (.content, ["contentMediaType", "contentEncoding", "contentSchema"]),
+        ]
+        return Dictionary(uniqueKeysWithValues: groups.flatMap { vocabulary, keys in keys.map { ($0, vocabulary) } })
+    }()
+
+    private func dialect(at uri: String) -> Dialect? {
+        if JSONSchema.supportedDialects.contains(uri) { return Dialect(isDraft7: uri.contains("draft-07")) }
+        guard let meta = registeredSchemas[uri], meta["$schema"] == "https://json-schema.org/draft/2020-12/schema",
+            let declaration = meta["$vocabulary"]?.objectValue else { return nil }
+        var active: Set<Vocabulary> = [.core]
+        for (name, requirement) in declaration {
+            guard let required = requirement.boolValue else { return nil }
+            if name.hasPrefix(Self.vocabularyBase), let known = Vocabulary(rawValue: String(name.dropFirst(Self.vocabularyBase.count))) {
+                active.insert(known)
+            } else if required {
+                return nil
+            }
+        }
+        return Dialect(isDraft7: false, vocabularies: active)
+    }
+
+    /// Indexes schema positions and named resources before references are followed. IDs are
+    /// parsed for identity and relative resolution only. No URI is fetched.
+    private mutating func indexLocations() throws(JSONSchemaError) {
+        let initial = URL(fileURLWithPath: "/.__limb_schema__/document")
+        let defaultDialect = Dialect(isDraft7: isDraft7)
+        var pending: [(schema: JSONValue, pointer: String, base: URL, dialect: Dialect, depth: Int)] = []
+        for (index, entry) in registeredSchemas.sorted(by: { $0.key < $1.key }).enumerated() {
+            guard let base = URL(string: entry.key, encodingInvalidCharacters: false), base.scheme != nil, base.fragment == nil else {
+                throw JSONSchemaError(reason: "registered schema URI must be absolute and fragment-free", pointer: "")
+            }
+            pending.append((entry.value, "registered:\(index)", base, defaultDialect, 0))
+        }
+        pending.append((document, "", initial, defaultDialect, 0))
+        while let (schema, pointer, inheritedBase, inheritedDialect, depth) = pending.popLast() {
+            guard depth <= limits.maxDepth else {
+                throw JSONSchemaError(reason: "schema nesting deeper than \(limits.maxDepth)", pointer: pointer)
+            }
+            guard locations.count < limits.maxSubschemas else {
+                throw JSONSchemaError(reason: "more than \(limits.maxSubschemas) subschemas", pointer: pointer)
+            }
+            let object = schema.objectValue
+            var base = inheritedBase
+            var dialect = inheritedDialect
+            if let declaration = object?["$schema"] {
+                guard depth == 0 || object?.contains("$id") == true, let uri = declaration.stringValue, let selected = self.dialect(at: uri) else {
+                    throw JSONSchemaError(reason: "unsupported JSON Schema dialect \(declaration)", pointer: pointer + "/$schema")
+                }
+                dialect = selected
+            }
+            let draft7 = dialect.isDraft7
+            let identifier = draft7 && object?.contains("$ref") == true ? nil : object?["$id"]
+            var oldAnchor: String?
+            if let identifier {
+                guard let id = identifier.stringValue, let parsed = uriReference(id, against: inheritedBase) else {
+                    throw JSONSchemaError(reason: "\"$id\" must be a valid URI-reference", pointer: pointer + "/$id")
+                }
+                if let fragment = parsed.fragment, !fragment.isEmpty {
+                    guard draft7 else {
+                        throw JSONSchemaError(reason: "\"$id\" must not contain a nonempty fragment", pointer: pointer + "/$id")
+                    }
+                    oldAnchor = fragment
+                }
+                base = parsed.base
+            }
+            let resource = ExactString(base.absoluteString)
+            if depth == 0 || (identifier != nil && oldAnchor == nil) {
+                if let existing = resources[resource], !existing.isBytewiseEqual(to: pointer) {
+                    throw JSONSchemaError(reason: "duplicate schema resource \(resource.text)", pointer: pointer + "/$id")
+                }
+                resources[resource] = pointer
+            }
+            if depth == 0, !pointer.isEmpty {
+                let retrieval = ExactString(inheritedBase.absoluteString)
+                if let existing = resources[retrieval], !existing.isBytewiseEqual(to: pointer) {
+                    throw JSONSchemaError(reason: "duplicate registered schema URI \(retrieval.text)", pointer: "")
+                }
+                resources[retrieval] = pointer
+            }
+            locations[ExactString(pointer)] = Location(schema: schema, resource: resource, dialect: dialect)
+            if let oldAnchor {
+                try addAnchor(oldAnchor, dynamic: false, resource: resource, pointer: pointer, keyword: "$id")
+            }
+            guard let object else { continue }
+            if !draft7 {
+                for (keyword, dynamic) in [("$anchor", false), ("$dynamicAnchor", true)] {
+                    guard let value = object[keyword] else { continue }
+                    guard let name = value.stringValue, isAnchorName(name) else {
+                        throw JSONSchemaError(reason: "invalid anchor name", pointer: pointer + "/" + keyword)
+                    }
+                    try addAnchor(name, dynamic: dynamic, resource: resource, pointer: pointer, keyword: keyword)
+                }
+            }
+            for (keyword, value) in object.reversed() {
+                guard dialect.uses(keyword) else { continue }
+                let child = pointer + "/" + escape(keyword)
+                if Self.schemaKeywords.contains(keyword) {
+                    if !draft7 && keyword == "additionalItems" || draft7 && keyword.hasPrefix("unevaluated") { continue }
+                    if draft7, keyword == "items", let list = value.arrayValue {
+                        for i in list.indices.reversed() { pending.append((list[i], child + "/\(i)", base, dialect, depth + 1)) }
+                    } else {
+                        pending.append((value, child, base, dialect, depth + 1))
+                    }
+                } else if Self.schemaMapKeywords.contains(keyword) || keyword == "dependencies" {
+                    if draft7 && keyword == "dependentSchemas" { continue }
+                    for (name, entry) in (value.objectValue ?? [:]).reversed() {
+                        if keyword == "dependencies", entry.arrayValue != nil { continue }
+                        pending.append((entry, child + "/" + escape(name), base, dialect, depth + 1))
+                    }
+                } else if Self.schemaListKeywords.contains(keyword), keyword != "prefixItems" || !draft7,
+                    let list = value.arrayValue
+                {
+                    for i in list.indices.reversed() { pending.append((list[i], child + "/\(i)", base, dialect, depth + 1)) }
+                }
+            }
+        }
+    }
+
+    private mutating func addAnchor(
+        _ name: String, dynamic: Bool, resource: ExactString, pointer: String, keyword: String
+    ) throws(JSONSchemaError) {
+        let key = ExactString(name)
+        guard anchors[resource]?[key] == nil else {
+            throw JSONSchemaError(reason: "duplicate schema anchor \(name)", pointer: pointer + "/" + keyword)
+        }
+        anchors[resource, default: [:]][key] = Anchor(pointer: pointer, dynamic: dynamic)
+    }
+
+    private func isAnchorName(_ name: String) -> Bool {
+        func initial(_ byte: UInt8) -> Bool { (65...90).contains(byte) || (97...122).contains(byte) || byte == 95 }
+        guard let first = name.utf8.first, initial(first) else { return false }
+        return name.utf8.dropFirst().allSatisfy { initial($0) || (48...57).contains($0) || $0 == 45 || $0 == 46 }
+    }
+
+    private func uriReference(_ reference: String, against base: URL) -> (base: URL, fragment: String?)? {
+        let pieces = reference.utf8.split(separator: 0x23, maxSplits: 1, omittingEmptySubsequences: false)
+        let head = String(decoding: pieces.first ?? reference.utf8[...], as: UTF8.self)
+        guard !head.utf8.contains(where: { $0 <= 0x20 || $0 >= 0x7F }),
+            head.removingPercentEncoding != nil,
+            let resolved = head.isEmpty ? base : URL(string: head, relativeTo: base)?.absoluteURL,
+            resolved.scheme != nil else { return nil }
+        guard pieces.count == 2 else { return (resolved, nil) }
+        guard let fragment = decodeFragment(pieces[1]) else { return nil }
+        return (resolved, fragment)
+    }
 
     mutating func compile(_ schema: JSONValue, pointer: String, depth: Int) throws(JSONSchemaError) -> Int {
         let key = ExactString(pointer)
@@ -391,6 +655,7 @@ private struct Compiler {
         switch schema {
         case .bool(let value):
             nodes[index].always = value
+            nodes[index].resource = locations[key]?.resource
             return index
         case .object(let object):
             nodes[index] = try compileObject(object, pointer: pointer, depth: depth)
@@ -400,22 +665,19 @@ private struct Compiler {
         }
     }
 
-    mutating func compileObject(_ object: JSONObject, pointer: String, depth: Int) throws(JSONSchemaError) -> Node {
+    mutating func compileObject(_ schema: JSONObject, pointer: String, depth: Int) throws(JSONSchemaError) -> Node {
         let node = Node()
-        for keyword in Compiler.unsupported where !isDraft7 && object.contains(keyword) {
+        let location = locations[ExactString(pointer)]
+        let dialect = location?.dialect ?? Dialect(isDraft7: self.isDraft7)
+        let isDraft7 = dialect.isDraft7
+        let object = dialect.vocabularies == nil ? schema : JSONObject(schema.filter { dialect.uses($0.key) })
+        node.resource = location?.resource
+        for keyword in ["$recursiveRef", "$recursiveAnchor"] where !isDraft7 && object.contains(keyword) {
             throw JSONSchemaError(reason: "unsupported keyword \"\(keyword)\"", pointer: pointer)
         }
 
         func sub(_ key: String) -> String { "\(pointer)/\(escape(key))" }
         try validateAnnotations(object, at: pointer)
-
-        if !pointer.isEmpty {
-            // Both would start a new schema resource, against which references inside resolve
-            // differently than against the document; only the root may have them.
-            for keyword in ["$id", "$schema"] where object.contains(keyword) {
-                throw JSONSchemaError(reason: "\"\(keyword)\" is supported only at the root of the schema", pointer: sub(keyword))
-            }
-        }
 
         // Definitions are checked whether or not anything refers to them: a malformed one is a
         // mistake even while unused. Each costs a node toward `maxSubschemas`.
@@ -427,8 +689,15 @@ private struct Compiler {
             guard let target = ref.stringValue else {
                 throw JSONSchemaError(reason: "\"$ref\" must be a string", pointer: sub("$ref"))
             }
-            node.ref = try resolve(target, from: pointer, depth: depth)
+            node.ref = try resolve(target, from: pointer, depth: depth).node
             if isDraft7 { return node }
+        }
+        if !isDraft7, let ref = object["$dynamicRef"] {
+            guard let target = ref.stringValue else {
+                throw JSONSchemaError(reason: "\"$dynamicRef\" must be a string", pointer: sub("$dynamicRef"))
+            }
+            let resolved = try resolve(target, from: pointer, depth: depth)
+            node.dynamicRef = (resolved.node, resolved.dynamicAnchor)
         }
 
         if let type = object["type"] {
@@ -454,9 +723,13 @@ private struct Compiler {
             guard case .array(let list) = values else {
                 throw JSONSchemaError(reason: "\"enum\" must be an array", pointer: sub("enum"))
             }
+            try validateNumericOperands(values, at: sub("enum"))
             node.enumeration = list
         }
-        node.const = object["const"]
+        if let constant = object["const"] {
+            try validateNumericOperands(constant, at: sub("const"))
+            node.const = constant
+        }
 
         node.minimum = try number(object, "minimum", pointer)
         node.maximum = try number(object, "maximum", pointer)
@@ -522,9 +795,13 @@ private struct Compiler {
         if let contains = object["contains"] {
             node.contains = try compile(contains, pointer: sub("contains"), depth: depth + 1)
         }
+        if !isDraft7, let items = object["unevaluatedItems"] {
+            node.unevaluatedItems = try compile(items, pointer: sub("unevaluatedItems"), depth: depth + 1)
+        }
 
         if let properties = object["properties"] {
-            node.properties = try compileMap(properties, pointer: sub("properties"), depth: depth)
+            let compiled = try compileMap(properties, pointer: sub("properties"), depth: depth)
+            node.properties = Dictionary(uniqueKeysWithValues: compiled.map { (ExactString($0.name), $0.node) })
         }
         if let patterns = object["patternProperties"] {
             guard case .object(let map) = patterns else {
@@ -539,6 +816,9 @@ private struct Compiler {
         }
         if let additional = object["additionalProperties"] {
             node.additionalProperties = try compile(additional, pointer: sub("additionalProperties"), depth: depth + 1)
+        }
+        if !isDraft7, let properties = object["unevaluatedProperties"] {
+            node.unevaluatedProperties = try compile(properties, pointer: sub("unevaluatedProperties"), depth: depth + 1)
         }
         if let names = object["propertyNames"] {
             node.propertyNames = try compile(names, pointer: sub("propertyNames"), depth: depth + 1)
@@ -634,7 +914,23 @@ private struct Compiler {
         guard let number = value.numberValue else {
             throw JSONSchemaError(reason: "\"\(key)\" must be a number", pointer: "\(pointer)/\(key)")
         }
+        guard number.isWithinExactDecimalRange else {
+            throw JSONSchemaError(reason: JSONSchema.exponentRangeError, pointer: "\(pointer)/\(key)")
+        }
         return number
+    }
+
+    private func validateNumericOperands(_ value: JSONValue, at pointer: String) throws(JSONSchemaError) {
+        var pending = [value]
+        while let next = pending.popLast() {
+            switch next {
+            case .array(let values): pending.append(contentsOf: values)
+            case .object(let object): pending.append(contentsOf: object.lazy.map(\.value))
+            case .number(let number) where !number.isWithinExactDecimalRange:
+                throw JSONSchemaError(reason: JSONSchema.exponentRangeError, pointer: pointer)
+            default: break
+            }
+        }
     }
 
     func count(_ object: JSONObject, _ key: String, _ pointer: String) throws(JSONSchemaError) -> Int? {
@@ -681,74 +977,43 @@ private struct Compiler {
         }
     }
 
-    /// Resolves a `$ref` inside the schema document. Nothing is ever fetched.
-    ///
-    /// The pointer is followed through the schema grammar, not just through the JSON: each step
-    /// must enter a keyword that holds schemas, so a reference can land only on a schema — not
-    /// on a member of `enum`, a `properties` map as a whole, or a string.
-    mutating func resolve(_ reference: String, from pointer: String, depth: Int) throws(JSONSchemaError) -> Int {
-        guard reference.hasPrefix("#") else {
-            throw JSONSchemaError(
-                reason: "\"$ref\" to \"\(reference)\" points outside the schema; external references are not dereferenced",
-                pointer: pointer)
-        }
+    /// A reference can only land at an indexed schema position inside the document.
+    mutating func resolve(
+        _ reference: String, from pointer: String, depth: Int
+    ) throws(JSONSchemaError) -> (node: Int, dynamicAnchor: ExactString?) {
         func unresolved(_ why: String) -> JSONSchemaError {
-            JSONSchemaError(reason: "\"$ref\" to \"\(reference)\" \(why)", pointer: pointer)
+            JSONSchemaError(reason: "schema reference \"\(reference)\" \(why)", pointer: pointer)
         }
-        guard let target = decodeFragment(reference.utf8.dropFirst()) else {
-            throw unresolved("is not a well-formed JSON pointer fragment")
+        guard let location = locations[ExactString(pointer)], let base = URL(string: location.resource.text),
+            let referenceURI = uriReference(reference, against: base)
+        else { throw unresolved("is not a well-formed URI-reference or JSON pointer fragment") }
+        let requestedResource = ExactString(referenceURI.base.absoluteString)
+        guard let documentPointer = resources[requestedResource], let resource = locations[ExactString(documentPointer)]?.resource else {
+            throw unresolved("points outside the schema; external references are not dereferenced")
         }
-        guard target.isEmpty || target.utf8.first == 0x2F else {
-            throw unresolved("points to an unsupported anchor")
-        }
-        enum Place { case schema, map, list, dependencies }
-        var current = document
-        var place = Place.schema
-        // The pointer the target is compiled under, spelled as the compiler spells pointers, so
-        // that two spellings of one location share a node.
-        var canonical = ""
-        // A pointer is "/"-separated; an empty token is a legitimate (empty) key.
-        for raw in target.utf8.split(separator: 0x2F, omittingEmptySubsequences: false).dropFirst() {
-            guard let token = unescape(String(decoding: raw, as: UTF8.self)) else {
-                throw unresolved("is not a well-formed JSON pointer fragment")
+        neededResources.insert(resource)
+        let fragment = referenceURI.fragment ?? ""
+        let pointer: String
+        var dynamicAnchor: ExactString?
+        if fragment.isEmpty {
+            pointer = documentPointer
+        } else if fragment.utf8.first == 0x2F {
+            var canonical = documentPointer
+            for raw in fragment.utf8.split(separator: 0x2F, omittingEmptySubsequences: false).dropFirst() {
+                guard let token = unescape(String(decoding: raw, as: UTF8.self)) else {
+                    throw unresolved("is not a well-formed JSON pointer fragment")
+                }
+                canonical += "/" + escape(token)
             }
-            canonical += "/" + escape(token)
-            switch (place, current) {
-            case (.schema, .object(let object)):
-                guard let next = object[token] else { throw unresolved("does not resolve") }
-                current = next
-                if Compiler.schemaKeywords.contains(token), token != "additionalItems" || isDraft7 {
-                    // Draft-07 `items` may be an array of schemas.
-                    if case .array = next, token == "items", isDraft7 { place = .list } else { place = .schema }
-                } else if Compiler.schemaMapKeywords.contains(token), token != "dependentSchemas" || !isDraft7 {
-                    place = .map
-                } else if Compiler.schemaListKeywords.contains(token), token != "prefixItems" || !isDraft7 {
-                    place = .list
-                } else if token == "dependencies" {
-                    place = .dependencies
-                } else {
-                    throw unresolved("does not point to a schema: \"\(token)\" is not a keyword that holds schemas")
-                }
-            case (.map, .object(let object)), (.dependencies, .object(let object)):
-                guard let next = object[token] else { throw unresolved("does not resolve") }
-                if case .array = next, place == .dependencies {
-                    throw unresolved("does not point to a schema")
-                }
-                current = next
-                place = .schema
-            case (.list, .array(let array)):
-                // Only the canonical spelling of an index: no sign, no leading zero.
-                guard let index = Int(token), String(index) == token, array.indices.contains(index) else {
-                    throw unresolved("does not resolve")
-                }
-                current = array[index]
-                place = .schema
-            default:
-                throw unresolved("does not resolve")
-            }
+            pointer = canonical
+        } else {
+            let name = ExactString(fragment)
+            guard let anchor = anchors[resource]?[name] else { throw unresolved("does not resolve to a named anchor") }
+            dynamicAnchor = anchor.dynamic ? name : nil
+            pointer = anchor.pointer
         }
-        guard place == .schema else { throw unresolved("does not point to a schema") }
-        return try compile(current, pointer: canonical, depth: depth + 1)
+        guard let schema = locations[ExactString(pointer)]?.schema else { throw unresolved("does not point to a schema") }
+        return (try compile(schema, pointer: pointer, depth: depth + 1), dynamicAnchor)
     }
 
     func escape(_ token: String) -> String {
@@ -826,7 +1091,10 @@ extension JSONSchema {
     /// `hops` counts consecutive steps between subschemas that did not descend into the
     /// instance. More of them than there are subschemas means the schema refers to itself
     /// without consuming input, which would otherwise never end.
-    func check(_ index: Int, _ instance: JSONValue, _ recursion: Int, _ hops: Int, _ run: Evaluation) -> SchemaViolation? {
+    private func check(
+        _ index: Int, _ instance: JSONValue, _ recursion: Int, _ hops: Int, _ run: Evaluation,
+        contributingTo parent: EvaluatedLocations? = nil
+    ) -> SchemaViolation? {
         guard recursion < limits.maxValidationRecursion, !run.stack.isExhausted else {
             return run.cutShort("nested deeper than the validator allows")
         }
@@ -836,7 +1104,31 @@ extension JSONSchema {
         }
         let node = nodes[index]
         if let always = node.always { return always ? nil : fail("no value is allowed here") }
-        if let ref = node.ref, let violation = check(ref, instance, recursion + 1, hops + 1, run) { return violation }
+        var enteredResource = false
+        if !dynamicAnchors.isEmpty, let resource = node.resource, run.dynamicScope.last != resource {
+            enteredResource = true
+            run.dynamicScope.append(resource)
+        }
+        defer { if enteredResource { run.dynamicScope.removeLast() } }
+        let track = instance.isContainer && (parent != nil || node.unevaluatedItems != nil || node.unevaluatedProperties != nil)
+        let locations = track ? EvaluatedLocations() : nil
+        func sibling(_ child: Int) -> SchemaViolation? {
+            check(child, instance, recursion + 1, hops + 1, run, contributingTo: locations)
+        }
+        if let ref = node.ref, let violation = sibling(ref) { return violation }
+        if let reference = node.dynamicRef {
+            var target = reference.fallback
+            if let anchor = reference.anchor {
+                for resource in run.dynamicScope {
+                    guard run.step() else { return fail("the schema takes too many steps") }
+                    if let candidate = dynamicAnchors[resource]?[anchor] {
+                        target = candidate
+                        break
+                    }
+                }
+            }
+            if let violation = sibling(target) { return violation }
+        }
 
         if let types = node.types, !matches(types, instance) {
             if instance.isNull, !types.isDisjoint(with: [.number, .integer]) {
@@ -845,37 +1137,37 @@ extension JSONSchema {
             }
             return fail("expected \(types.names), got \(instance.typeName)")
         }
-        if node.enumeration != nil || node.const != nil, !canCompare(instance) {
-            // Not an answer about the value: make sure the run is repeated where there is room.
-            run.stack.noteExhausted()
-            return fail("nested too deeply to compare on the stack that is left")
-        }
-        if let enumeration = node.enumeration, !enumeration.contains(instance) {
+        if let enumeration = node.enumeration, !enumeration.contains(where: { run.equal(instance, $0) }) {
             let allowed = enumeration.prefix(12).map(brief).joined(separator: ", ")
             return fail("must be one of: \(allowed)")
         }
-        if let const = node.const, const != instance { return fail("must be \(brief(const))") }
+        if let const = node.const, !run.equal(instance, const) { return fail("must be \(brief(const))") }
 
         switch instance {
         case .number(let number):
-            if let violation = checkNumber(node, number) { return violation }
+            if let violation = checkNumber(node, number, run) { return violation }
         case .string(let string):
             if let violation = checkString(node, string, run) { return violation }
         case .array(let array):
-            if let violation = checkArray(node, array, recursion, run) { return violation }
+            if let violation = checkArray(node, array, recursion, run, locations) { return violation }
         case .object(let object):
-            if let violation = checkObject(node, object, recursion, hops, run) { return violation }
+            if let violation = checkObject(node, object, recursion, hops, run, locations) { return violation }
         default: break
         }
 
         for child in node.allOf {
-            if let violation = check(child, instance, recursion + 1, hops + 1, run) { return violation }
+            if let violation = sibling(child) { return violation }
         }
-        if !node.anyOf.isEmpty, !node.anyOf.contains(where: { check($0, instance, recursion + 1, hops + 1, run) == nil }) {
-            return fail("does not match any of the allowed alternatives")
+        if !node.anyOf.isEmpty {
+            var found = false
+            for child in node.anyOf where sibling(child) == nil {
+                found = true
+                if locations == nil { break }
+            }
+            if !found { return fail("does not match any of the allowed alternatives") }
         }
         if !node.oneOf.isEmpty {
-            let matching = run.inverting { node.oneOf.count { check($0, instance, recursion + 1, hops + 1, run) == nil } }
+            let matching = run.inverting { node.oneOf.count { sibling($0) == nil } }
             if matching != 1 {
                 return fail(matching == 0 ? "does not match any of the allowed alternatives" : "matches more than one alternative")
             }
@@ -884,11 +1176,26 @@ extension JSONSchema {
             return fail("matches a schema it must not match")
         }
         if let condition = node.ifNode {
-            if run.inverting({ check(condition, instance, recursion + 1, hops + 1, run) }) == nil {
-                if let then = node.thenNode, let violation = check(then, instance, recursion + 1, hops + 1, run) { return violation }
-            } else if let otherwise = node.elseNode, let violation = check(otherwise, instance, recursion + 1, hops + 1, run) {
+            if run.inverting({ sibling(condition) }) == nil {
+                if let then = node.thenNode, let violation = sibling(then) { return violation }
+            } else if let otherwise = node.elseNode, let violation = sibling(otherwise) {
                 return violation
             }
+        }
+        if let locations {
+            if let unevaluated = node.unevaluatedItems, case .array(let array) = instance {
+                for (offset, item) in array.enumerated() where !locations.items.contains(offset) {
+                    if let violation = check(unevaluated, item, recursion + 1, 0, run) { return nested(violation, "[\(offset)]") }
+                    locations.items.insert(offset)
+                }
+            }
+            if let unevaluated = node.unevaluatedProperties, case .object(let object) = instance {
+                for (name, value) in object where !locations.properties.contains(ExactString(name)) {
+                    if let violation = check(unevaluated, value, recursion + 1, 0, run) { return nested(violation, name) }
+                    locations.properties.insert(ExactString(name))
+                }
+            }
+            parent?.merge(locations, run: run)
         }
         return nil
     }
@@ -904,7 +1211,10 @@ extension JSONSchema {
         }
     }
 
-    private func checkNumber(_ node: Node, _ number: JSONNumber) -> SchemaViolation? {
+    private func checkNumber(_ node: Node, _ number: JSONNumber, _ run: Evaluation) -> SchemaViolation? {
+        guard node.minimum != nil || node.maximum != nil || node.exclusiveMinimum != nil || node.exclusiveMaximum != nil
+            || node.multipleOf != nil else { return nil }
+        guard run.accepts(number) else { return fail(Self.exponentRangeError) }
         if let minimum = node.minimum, number < minimum { return fail("must be at least \(minimum)") }
         if let maximum = node.maximum, number > maximum { return fail("must be at most \(maximum)") }
         if let bound = node.exclusiveMinimum, number <= bound { return fail("must be greater than \(bound)") }
@@ -948,20 +1258,30 @@ extension JSONSchema {
         return value.nestingDepth * 1536 + 16 * 1024 <= remaining
     }
 
-    private func checkArray(_ node: Node, _ array: [JSONValue], _ recursion: Int, _ run: Evaluation) -> SchemaViolation? {
+    private func checkArray(
+        _ node: Node, _ array: [JSONValue], _ recursion: Int, _ run: Evaluation, _ locations: EvaluatedLocations?
+    ) -> SchemaViolation? {
         if let minimum = node.minItems, array.count < minimum { return fail("must have at least \(minimum) items") }
         if let maximum = node.maxItems, array.count > maximum { return fail("must have at most \(maximum) items") }
         for (index, element) in array.enumerated() {
             let schema: Int?
             if index < node.prefixItems.count { schema = node.prefixItems[index] } else { schema = node.items }
-            if let schema, let violation = check(schema, element, recursion + 1, 0, run) {
-                return nested(violation, "[\(index)]")
+            if let schema {
+                if let violation = check(schema, element, recursion + 1, 0, run) { return nested(violation, "[\(index)]") }
+                locations?.items.insert(index)
             }
         }
         if let contains = node.contains {
             // With a maximum, an item cut short and so not counted could let the array through.
-            func counts(_ item: JSONValue) -> Bool { check(contains, item, recursion + 1, 0, run) == nil }
-            let matching = node.maxContains == nil ? array.count(where: counts) : run.inverting { array.count(where: counts) }
+            func matchingItems() -> Int {
+                var matching = 0
+                for (index, item) in array.enumerated() where check(contains, item, recursion + 1, 0, run) == nil {
+                    matching += 1
+                    locations?.items.insert(index)
+                }
+                return matching
+            }
+            let matching = node.maxContains == nil && locations == nil ? matchingItems() : run.inverting(matchingItems)
             let minimum = node.minContains ?? 1
             if matching < minimum { return fail("must contain at least \(minimum) matching items") }
             if let maximum = node.maxContains, matching > maximum {
@@ -969,6 +1289,7 @@ extension JSONSchema {
             }
         }
         if node.uniqueItems {
+            guard array.allSatisfy(run.chargeHash) else { return fail("the schema could not compare all array items") }
             guard canCompare(.array(array)) else {
                 run.stack.noteExhausted()
                 return fail("nested too deeply to compare on the stack that is left")
@@ -979,7 +1300,7 @@ extension JSONSchema {
     }
 
     private func checkObject(
-        _ node: Node, _ object: JSONObject, _ recursion: Int, _ hops: Int, _ run: Evaluation
+        _ node: Node, _ object: JSONObject, _ recursion: Int, _ hops: Int, _ run: Evaluation, _ locations: EvaluatedLocations?
     ) -> SchemaViolation? {
         for name in node.required where !object.contains(name) {
             return SchemaViolation(path: [name], reason: "missing required field")
@@ -989,9 +1310,9 @@ extension JSONSchema {
 
         for (name, value) in object {
             var evaluated = false
-            if let property = node.properties.first(where: { $0.name.isBytewiseEqual(to: name) }) {
+            if let property = node.properties[ExactString(name)] {
                 evaluated = true
-                if let violation = check(property.node, value, recursion + 1, 0, run) { return nested(violation, name) }
+                if let violation = check(property, value, recursion + 1, 0, run) { return nested(violation, name) }
             }
             for entry in node.patternProperties {
                 guard let found = run.matches(entry.pattern, name) else { return fail("too many pattern steps") }
@@ -1002,7 +1323,9 @@ extension JSONSchema {
             if !evaluated, let additional = node.additionalProperties {
                 if nodes[additional].always == false { return nested(fail("unknown field"), name) }
                 if let violation = check(additional, value, recursion + 1, 0, run) { return nested(violation, name) }
+                evaluated = true
             }
+            if evaluated { locations?.properties.insert(ExactString(name)) }
             if let names = node.propertyNames, let violation = check(names, .string(name), recursion + 1, 0, run) {
                 return nested(SchemaViolation(path: [], reason: "invalid field name: \(violation.reason)"), name)
             }
@@ -1014,7 +1337,7 @@ extension JSONSchema {
         }
         for entry in node.dependentSchemas where object.contains(entry.name) {
             // The same instance again: a step that consumes nothing.
-            if let violation = check(entry.node, .object(object), recursion + 1, hops + 1, run) { return violation }
+            if let violation = check(entry.node, .object(object), recursion + 1, hops + 1, run, contributingTo: locations) { return violation }
         }
         return nil
     }
