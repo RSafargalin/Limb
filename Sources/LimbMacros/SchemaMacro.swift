@@ -127,6 +127,7 @@ public struct SchemaMacro: ExtensionMacro {
         var fields: [String] = []
         var decode: [String] = []
         var encode: [String] = []
+        var boundedEncode: [String] = []
         for property in properties {
             let key = property.key.literal
             let reference = property.reference
@@ -139,7 +140,10 @@ public struct SchemaMacro: ExtensionMacro {
             } else {
                 decode.append("self.\(reference) = try LimbCore.SchemaSupport.decode(__limbObject, \(key))")
             }
-            encode.append("LimbCore.SchemaSupport.set(&__limbObject, \(key), self.\(reference))")
+            let includeNil = property.hasDefault ? ", includeNil: true" : ""
+            encode.append("LimbCore.SchemaSupport.set(&__limbObject, \(key), self.\(reference)\(includeNil))")
+            boundedEncode.append(
+                "try LimbCore.SchemaSupport.set(&__limbObject, \(key), self.\(reference)\(includeNil), maxDepth: __limbDepth - 1)")
         }
         let source = """
             extension \(type.trimmed)\(conformance) {
@@ -159,6 +163,13 @@ public struct SchemaMacro: ExtensionMacro {
                 \(access)var jsonValue: LimbCore.JSONValue {
                     \(properties.isEmpty ? "let" : "var") __limbObject = LimbCore.JSONObject(minimumCapacity: \(properties.count))
                     \(encode.joined(separator: "\n"))
+                    return .object(__limbObject)
+                }
+
+                \(access)func jsonValue(maxDepth __limbDepth: Swift.Int) throws(LimbCore.JSONEncodingDepthError) -> LimbCore.JSONValue {
+                    guard __limbDepth > 0 else { throw LimbCore.JSONEncodingDepthError() }
+                    \(properties.isEmpty ? "let" : "var") __limbObject = LimbCore.JSONObject(minimumCapacity: \(properties.count))
+                    \(boundedEncode.joined(separator: "\n"))
                     return .object(__limbObject)
                 }
             }

@@ -120,6 +120,9 @@ public struct ServerConfiguration: Sendable {
     public var schemaResources: [String: JSONValue] = [:]
     /// How long `requestState` stays valid. Elicitation waits for a person, hence minutes.
     public var requestStateLifetimeSeconds = 900
+    /// Maximum nesting of JSON objects and arrays in a typed tool result.
+    /// Zero permits scalars, and values above `JSONParseOptions.depthCeiling` use that ceiling.
+    public var maxToolOutputDepth = 128
     /// The most a `requestState` may hold before sealing. Answers from earlier rounds travel in
     /// it, so this bounds what one request can make the client carry back and forth.
     public var maxRequestStateBytes = 1 << 20

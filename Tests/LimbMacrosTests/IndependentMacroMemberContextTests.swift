@@ -406,12 +406,11 @@ private func makeServer() throws -> Server {
                 == "0 0 [] 1")
     }
 
-    /// Whatever expression the default is, it is used when the argument is absent — or `null`,
-    /// for an optional — and only then.
+    /// Arbitrary expressions supply defaults only when the argument is absent.
     @Test func defaultsThatAreArbitraryExpressions() async throws {
         let client = TestClient(try makeServer())
         #expect(try await client.independentMacroCall("im_rich_defaults").independentMacroFirstText == "[1, 2, 3] 5 a1b true 1 [\"k\": []] false 1")
-        #expect(try await client.independentMacroCall("im_rich_defaults", ["v": nil]).independentMacroFirstText == "[1, 2, 3] 5 a1b true 1 [\"k\": []] false 1")
+        #expect(try await client.independentMacroCall("im_rich_defaults", ["v": nil]).independentMacroFirstText == "[1, 2, 3] 5 a1b true 0 [\"k\": []] false 1")
         let explicit = try await client.independentMacroCall(
             "im_rich_defaults", ["x": [], "y": 0, "z": "", "w": 0, "v": 9, "u": [:], "t": true, "s": 7])
         #expect(explicit.independentMacroFirstText == "[] 0  false 9 [:] true 7")

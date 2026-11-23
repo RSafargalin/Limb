@@ -72,6 +72,7 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
         var nameNode = Syntax(typeName)
         var title = "nil"
         var hints: [String] = []
+        var explicitContext: (name: String, node: Syntax)?
         if let arguments = node.arguments?.as(LabeledExprListSyntax.self) {
             for argument in arguments {
                 let expression = argument.expression.trimmedDescription
@@ -87,6 +88,12 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
                 case "destructive": hints.append("destructiveHint: \(expression)")
                 case "idempotent": hints.append("idempotentHint: \(expression)")
                 case "openWorld": hints.append("openWorldHint: \(expression)")
+                case "contextParameter":
+                    if expression == "nil" { continue }
+                    guard let name = argument.expression.as(StringLiteralExprSyntax.self)?.representedLiteralValue else {
+                        throw failure("contextParameter must name a parameter with a string literal", at: argument.expression)
+                    }
+                    explicitContext = (name, Syntax(argument.expression))
                 case .some(let label): throw failure("unknown @Tool argument '\(label)'", at: argument)
                 }
             }
@@ -110,9 +117,10 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
         var declarations: [String] = []
         var decode: [String] = []
         var callArguments: [String] = []
-        var defaults: [String] = []
+        var defaults: [DeclSyntax] = []
         var seen: Set<String> = []
         var isOwnSignature = true
+        var matchedExplicitContext = false
         for (index, parameter) in function.signature.parameterClause.parameters.enumerated() {
             let label = parameter.firstName.text
             let local = (parameter.secondName ?? parameter.firstName).text
@@ -124,7 +132,14 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
             var bare = parameter.type
             if let optional = bare.as(OptionalTypeSyntax.self) { bare = optional.wrappedType }
             let base = baseName(of: bare)
-            if base == "ToolContext" || base == "RequestContext" {
+            let namesExplicitContext = explicitContext?.name == argumentName || explicitContext?.name == local.withoutBackticks
+            if namesExplicitContext || (explicitContext == nil && isRequestContextType(bare)) {
+                if namesExplicitContext {
+                    guard !matchedExplicitContext else {
+                        throw failure("more than one parameter matches contextParameter", at: parameter)
+                    }
+                    matchedExplicitContext = true
+                }
                 callArguments.append("\(prefix)__limbContext")
                 if !(index == 1 && label == "context") { isOwnSignature = false }
                 continue
@@ -155,14 +170,22 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
                 // The default is evaluated in a static method of its own, where it means exactly
                 // what it means in the signature: it may name the type's static members with or
                 // without `Self.`, and it is one expression whatever operators it contains.
-                defaults.append(
-                    "case \(index): let __limbDefault: \(typeText) = (\(defaultValue.trimmedDescription)); return __limbDefault as! __LimbValue")
+                let helper = context.makeUniqueName("limbDefault").trimmedDescription
+                let expression = defaultValue.trimmedDescription
+                defaults.append("""
+                    private static func \(raw: helper)() -> \(raw: typeText) {
+                        (\(raw: expression))
+                    }
+                    """)
                 decode.append(
-                    "\(variable) = try LimbCore.SchemaSupport.decode(__limbArguments, \(argumentName.literal), default: Self.__limbDefault(__limbArgument: \(index) as Swift.Int))")
+                    "\(variable) = try LimbCore.SchemaSupport.decode(__limbArguments, \(argumentName.literal), default: Self.\(helper)())")
             } else {
                 decode.append("\(variable) = try LimbCore.SchemaSupport.decode(__limbArguments, \(argumentName.literal))")
             }
             callArguments.append("\(prefix)\(variable)")
+        }
+        if let explicitContext, !matchedExplicitContext {
+            throw failure("contextParameter does not match a parameter of 'call'", at: explicitContext.node)
         }
         if isOwnSignature, function.signature.parameterClause.parameters.count == 2 {
             throw failure(
@@ -171,14 +194,15 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
         }
 
         let effects = function.signature.effectSpecifiers
-        let invocationPrefix = (effects?.throwsClause != nil ? "try " : "") + (effects?.asyncSpecifier != nil ? "await " : "")
-        let invocation = "\(invocationPrefix)self.call(\(callArguments.joined(separator: ", ")))"
+        let awaiting = effects?.asyncSpecifier != nil ? "await " : ""
+        let invocation = "\(awaiting)self.call(\(callArguments.joined(separator: ", ")))"
         let returnType = function.signature.returnClause?.type.trimmedDescription
         let returnsNothing = returnType == nil || returnType == "Void" || returnType == "Swift.Void" || returnType == "()"
         let outputSchema = returnsNothing ? "nil" : "LimbServer.ToolSupport.outputSchema((\(returnType!)).self)"
         let body =
             returnsNothing
-            ? "\(invocation)\nreturn LimbCore.ToolResult()" : "return LimbServer.ToolSupport.result(\(invocation))"
+            ? "\(effects?.throwsClause != nil ? "try " : "")\(invocation)\nreturn LimbCore.ToolResult()"
+            : "return try LimbServer.ToolSupport.result(\(invocation), context: __limbContext)"
         let annotations = hints.isEmpty ? "nil" : "LimbCore.ToolAnnotations(\(hints.joined(separator: ", ")))"
         let access = accessPrefix(of: declaration)
         // `MCPTool` is nonisolated, and its `definition` is synchronous: on a type isolated to
@@ -233,16 +257,14 @@ public struct ToolMacro: MemberMacro, ExtensionMacro {
                 \(raw: body)
             }
             """
-        guard !defaults.isEmpty else { return [definition, call] }
-        let defaultValues: DeclSyntax = """
-            private static func __limbDefault<__LimbValue>(__limbArgument __limbIndex: Swift.Int) -> __LimbValue {
-                switch __limbIndex {
-                \(raw: defaults.joined(separator: "\n"))
-                default: fatalError("no default for argument \\(__limbIndex)")
-                }
-            }
-            """
-        return [definition, call, defaultValues]
+        return [definition, call] + defaults
+    }
+
+    static func isRequestContextType(_ type: TypeSyntax) -> Bool {
+        guard let name = baseName(of: type), name == "ToolContext" || name == "RequestContext" else { return false }
+        guard let qualified = type.as(MemberTypeSyntax.self) else { return true }
+        let module = qualified.baseType.trimmedDescription
+        return module == "Limb" || module == "LimbServer"
     }
 
     /// Whether the type carries an attribute that may be a global actor: `@MainActor`, or any

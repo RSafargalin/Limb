@@ -3,6 +3,10 @@ import LimbTesting
 import Testing
 #if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 
@@ -193,12 +197,16 @@ private enum R2MConditionalEnum: String {
         IndependentMacroCheckRoundTrip(R2MConditionalStruct(a: -1, b: nil))
         let value = try R2MConditionalStruct(json: ["a": 2])
         #expect(value.jsonValue == ["a": 2])
+        #if canImport(Darwin)
         #expect(value.nested == "nested")
+        #endif
         #expect(value.debugOnly > 2)
         #if DEBUG
         #expect(R2MConditionalStruct.mode == "debug")
-        #else
+        #elseif canImport(Darwin)
         #expect(R2MConditionalStruct.mode == "release on Darwin")
+        #else
+        #expect(R2MConditionalStruct.mode == "release")
         #endif
     }
 
