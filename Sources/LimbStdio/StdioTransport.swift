@@ -87,9 +87,11 @@ extension Server {
     /// stdin or stdout may run at once. A second such call reports a diagnostic and returns.
     ///
     /// A closed output is handled as `EPIPE` with the application's `SIGPIPE` disposition
-    /// intact. On Darwin the writer temporarily enables `F_SETNOSIGPIPE` on the output's
-    /// shared open file description. Coordinate changes to that option on aliased descriptors
-    /// with the writer's lifetime, which can extend beyond `run` when output stops draining.
+    /// intact. On Darwin the writer of a non-socket output temporarily enables
+    /// `F_SETNOSIGPIPE` on the shared open file description. Limb reserves the endpoint
+    /// until the writer exits, which can be after `run` returns when output stops draining.
+    /// Another session using that endpoint is rejected. Coordinate host writes and changes
+    /// to that option on aliased descriptors with the writer's lifetime.
     public func run(_ transport: StdioTransport = StdioTransport()) async {
         let usesStandardStreams = transport.input == STDIN_FILENO || transport.output == STDOUT_FILENO
         if usesStandardStreams, !StandardStreamOwnership.acquire() {
@@ -151,6 +153,89 @@ private enum StandardStreamOwnership {
     }
 
     static func release() { active.withLock { $0 = false } }
+}
+
+private struct StdioWriterOutput: Sendable {
+    let descriptor: Int32
+
+    #if canImport(Darwin)
+    // Use the live file identity conservatively. Separate opens of one file may compare
+    // equal. Reject their overlapping use instead of assuming they share a signal option.
+    private struct Identity: Hashable, Sendable {
+        let device: dev_t
+        let inode: ino_t
+        let type: mode_t
+    }
+
+    private static let reserved = Mutex<Set<Identity>>([])
+    private let socket: Bool
+    private let reservation: Identity?
+    private let restoreSignalOption: Bool
+    #endif
+
+    enum SetupError: Error {
+        case inUse
+        case posix(Int32)
+    }
+
+    init(_ descriptor: Int32) throws(SetupError) {
+        self.descriptor = descriptor
+        #if canImport(Darwin)
+        guard descriptor >= 0 else {
+            socket = false
+            reservation = nil
+            restoreSignalOption = false
+            return
+        }
+        var information = stat()
+        guard fstat(descriptor, &information) == 0 else { throw .posix(errno) }
+        let type = information.st_mode & mode_t(S_IFMT)
+        socket = type == mode_t(S_IFSOCK)
+        if socket {
+            reservation = nil
+            restoreSignalOption = false
+            return
+        }
+
+        let identity = Identity(device: information.st_dev, inode: information.st_ino, type: type)
+        guard Self.reserved.withLock({ $0.insert(identity).inserted }) else { throw .inUse }
+        let previous = fcntl(descriptor, F_GETNOSIGPIPE)
+        if previous < 0 || (previous == 0 && fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0) {
+            let failure = errno
+            Self.reserved.withLock { _ = $0.remove(identity) }
+            throw .posix(failure)
+        }
+        reservation = identity
+        restoreSignalOption = previous == 0
+        #endif
+    }
+
+    func write(_ bytes: UnsafeRawPointer?, count: Int) -> Int {
+        #if canImport(Darwin)
+        if socket { return Darwin.send(descriptor, bytes, count, MSG_NOSIGNAL) }
+        return Darwin.write(descriptor, bytes, count)
+        #elseif canImport(Glibc)
+        return Glibc.write(descriptor, bytes, count)
+        #else
+        return Musl.write(descriptor, bytes, count)
+        #endif
+    }
+
+    func closeAndRestore() -> Int32? {
+        guard descriptor >= 0 else { return nil }
+        #if canImport(Darwin)
+        if let reservation {
+            return Self.reserved.withLock { endpoints in
+                let failure = restoreSignalOption && fcntl(descriptor, F_SETNOSIGPIPE, 0) < 0 ? errno : nil
+                close(descriptor)
+                endpoints.remove(reservation)
+                return failure
+            }
+        }
+        #endif
+        close(descriptor)
+        return nil
+    }
 }
 
 /// Keeps stray writes to descriptor 1 off the protocol while default-transport sessions run.
@@ -293,9 +378,21 @@ final class StdioSession: Sendable {
             diagnostics("stdio: could not duplicate the output descriptor: \(String(cString: strerror(duplicationError)))")
             return false
         }
-        guard spawnThread(name: writerThreadName, { self.writeLoop() }) else {
-            diagnostics("stdio: could not start the writer thread")
+        let writerOutput: StdioWriterOutput
+        do {
+            writerOutput = try StdioWriterOutput(output)
+        } catch {
+            switch error {
+            case .inUse: diagnostics("stdio: the output endpoint already belongs to another writer")
+            case .posix(let code): diagnostics("stdio: could not prepare the writer output: \(String(cString: strerror(code)))")
+            }
             if output >= 0 { close(output) }
+            queue.close()
+            return false
+        }
+        guard spawnThread(name: writerThreadName, { self.writeLoop(writingTo: writerOutput) }) else {
+            diagnostics("stdio: could not start the writer thread")
+            closeWriterOutput(writerOutput)
             queue.close()
             return false
         }
@@ -501,29 +598,24 @@ final class StdioSession: Sendable {
 
     // MARK: Writer
 
-    private func writeLoop() {
-        #if canImport(Darwin)
-        // Darwin delivers SIGPIPE from pipe writes to the process, even if this thread
-        // blocks it. F_SETNOSIGPIPE applies to the duplicate and its aliases.
-        let previousNoSignal = output >= 0 ? fcntl(output, F_GETNOSIGPIPE) : 1
-        let configured = previousNoSignal > 0 || (previousNoSignal == 0 && fcntl(output, F_SETNOSIGPIPE, 1) == 0)
-        let status = configured ? 0 : errno
-        #else
+    private func writeLoop(writingTo writerOutput: StdioWriterOutput) {
+        var healthy = true
+        #if !canImport(Darwin)
         var blocked = sigset_t()
         sigemptyset(&blocked)
         sigaddset(&blocked, SIGPIPE)
         let status = pthread_sigmask(SIG_BLOCK, &blocked, nil)
-        #endif
         if status != 0 {
             diagnostics("stdio: could not suppress SIGPIPE for the writer: \(String(cString: strerror(status)))")
             queue.close()
             stopReading()
             connection.endGracePeriod()
+            healthy = false
         }
-        var healthy = status == 0
+        #endif
         while let frame = queue.takeFrame() {
             if healthy {
-                healthy = writeFrame(frame)
+                healthy = writeFrame(frame, writingTo: writerOutput)
                 if !healthy {
                     // The peer is gone. Stop accepting output, wake the reader to shut down, and
                     // cancel what is in flight: whether or not the input has ended already,
@@ -535,14 +627,7 @@ final class StdioSession: Sendable {
             }
             queue.didWrite()
         }
-        if output >= 0 {
-            #if canImport(Darwin)
-            if configured, previousNoSignal == 0, fcntl(output, F_SETNOSIGPIPE, 0) < 0 {
-                diagnostics("stdio: could not restore the output SIGPIPE option: \(String(cString: strerror(errno)))")
-            }
-            #endif
-            close(output)
-        }
+        closeWriterOutput(writerOutput)
         let waiter = completion.withLock { state in
             state.writerDone = true
             defer { state.writerWaiter = nil }
@@ -551,7 +636,13 @@ final class StdioSession: Sendable {
         waiter?.resume()
     }
 
-    private func writeFrame(_ frame: OutboundQueue.FrameLease) -> Bool {
+    private func closeWriterOutput(_ output: StdioWriterOutput) {
+        if let error = output.closeAndRestore() {
+            diagnostics("stdio: could not restore the output SIGPIPE option: \(String(cString: strerror(error)))")
+        }
+    }
+
+    private func writeFrame(_ frame: OutboundQueue.FrameLease, writingTo writerOutput: StdioWriterOutput) -> Bool {
         var offset = 0
         var bytes = frame.bytes
         let appendedNewline = bytes.count < 32 * 1024
@@ -581,7 +672,7 @@ final class StdioSession: Sendable {
                 var writeError: Int32 = 0
                 let attempt = queue.writeIfCurrent(frame) { _ in
                     bytes.withUnsafeBytes { raw in
-                        let count = write(output, raw.baseAddress, 1)
+                        let count = writerOutput.write(raw.baseAddress, count: 1)
                         if count < 0 { writeError = errno }
                         return count
                     }
@@ -603,7 +694,8 @@ final class StdioSession: Sendable {
             }
             guard offset > 0 else { return true }
         }
-        return writeAll(bytes, from: offset) && (appendedNewline || writeAll([0x0A]))
+        return writeAll(bytes, from: offset, writingTo: writerOutput) &&
+            (appendedNewline || writeAll([0x0A], writingTo: writerOutput))
     }
 
     private func reportWriteFailure(_ error: Int32) {
@@ -623,8 +715,7 @@ final class StdioSession: Sendable {
     /// way when draining began may be up to 16 KiB. The kilobyte is approximate where the
     /// kernel makes room only in larger units: a Linux pipe frees space a whole page (4 KiB) at
     /// a time, so there a peer must take about a page per `outputDrainSeconds`.
-    private func writeAll(_ bytes: [UInt8], from start: Int = 0) -> Bool {
-        let output = self.output
+    private func writeAll(_ bytes: [UInt8], from start: Int = 0, writingTo writerOutput: StdioWriterOutput) -> Bool {
         return bytes.withUnsafeBytes { raw in
             var offset = start
             while offset < raw.count {
@@ -632,7 +723,7 @@ final class StdioSession: Sendable {
                 // when "is the peer still reading?" is asked, and the answer must not take the
                 // time a slow peer needs for a large piece.
                 let pieceSize = completion.withLock { $0.draining } ? 1024 : 16 * 1024
-                let written = write(output, raw.baseAddress! + offset, Swift.min(raw.count - offset, pieceSize))
+                let written = writerOutput.write(raw.baseAddress! + offset, count: Swift.min(raw.count - offset, pieceSize))
                 if written > 0 {
                     offset += written
                     completion.withLock { $0.lastProgress = ContinuousClock.now }

@@ -4,6 +4,7 @@ import Darwin
 #else
 import Glibc
 #endif
+import Dispatch
 import Foundation
 import Limb
 import Synchronization
@@ -44,6 +45,12 @@ import Testing
     @Test func writerRestoresTheCallersOutputSignalOption() async {
         await #expect(processExitsWith: .success) {
             await StdioOwnershipProbe.run { try await StdioOwnershipProbe.checkOutputSignalOption() }
+        }
+    }
+
+    @Test func aWriterRetainsItsOutputUntilItActuallyExits() async {
+        await #expect(processExitsWith: .success) {
+            await StdioOwnershipProbe.run { try await StdioOwnershipProbe.checkOutputOwnershipAfterDrain() }
         }
     }
     #endif
@@ -143,8 +150,8 @@ private enum StdioOwnershipProbe {
     private final class Session: Sendable {
         private let finished = Mutex(false)
 
-        init(name: String, transport: StdioTransport = StdioTransport()) throws {
-            let server = Server(name: name, version: "1")
+        init(name: String, transport: StdioTransport = StdioTransport(), drainSeconds: Double = 5) throws {
+            let server = Server(name: name, version: "1") { $0.outputDrainSeconds = drainSeconds }
             try server.register(tool: ToolDefinition(name: "probe", inputSchema: ["type": "object"])) { _, _ in
                 .text("ok")
             }
@@ -291,6 +298,51 @@ private enum StdioOwnershipProbe {
             try await session.waitForReturn("The session did not end after EOF")
             try check(fcntl(output, F_GETNOSIGPIPE) == original, "The writer changed the caller's option after shutdown")
         }
+    }
+
+    static func checkOutputOwnershipAfterDrain() async throws {
+        let peer = try Peer()
+        let writerReachedFrame = Atomic(false)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        var transport = peer.transport
+        transport.beforeKeyedWrite = { _ in
+            writerReachedFrame.store(true, ordering: .releasing)
+            _ = releaseWriter.wait(timeout: .now() + .seconds(12))
+        }
+        let owner = try Session(name: "draining-writer", transport: transport, drainSeconds: 0)
+        defer { releaseWriter.signal() }
+        try peer.input.send(#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"probe","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#)
+        let clock = ContinuousClock()
+        let firstDeadline = clock.now + .seconds(5)
+        while !writerReachedFrame.load(ordering: .acquiring), clock.now < firstDeadline {
+            try await clock.sleep(for: .milliseconds(5))
+        }
+        try check(writerReachedFrame.load(ordering: .acquiring), "Writer did not reach its frame")
+        try peer.endInput()
+        try await owner.waitForReturn("The session did not return while its writer was still active")
+
+        let other = try Channel()
+        let alias = dup(peer.output.writeEnd)
+        try check(alias >= 0, "Could not duplicate the active output")
+        let aliasedTransport = StdioTransport(input: other.readEnd, output: alias)
+        let contender = try Session(name: "overlapping-writer", transport: aliasedTransport)
+        try await contender.waitForReturn("A second writer started on the still-active output")
+
+        releaseWriter.signal()
+        let first = try peer.output.receiveLine()
+        try check(first.contains("draining-writer"), "The first writer did not finish its response")
+        let deadline = clock.now + .seconds(5)
+        while fcntl(alias, F_GETNOSIGPIPE) != 0, clock.now < deadline {
+            try await clock.sleep(for: .milliseconds(5))
+        }
+        try check(fcntl(alias, F_GETNOSIGPIPE) == 0, "The old writer did not restore the output option")
+
+        let successor = try Session(name: "replacement-writer", transport: aliasedTransport)
+        try other.send(#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#)
+        let second = try peer.output.receiveLine()
+        try check(second.contains("replacement-writer"), "The output was not available for the successor")
+        try check(close(other.writeEnd) == 0, "Could not end the replacement session's input")
+        try await successor.waitForReturn("The replacement session did not end at EOF")
     }
     #endif
 
