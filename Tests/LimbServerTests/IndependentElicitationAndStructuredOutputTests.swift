@@ -45,7 +45,10 @@ struct IndependentElicitationAndStructuredOutputTests {
     }
 
     private static let validSchemas: [JSONValue] = [
-        ["type": "object", "properties": ["name": ["type": "string"], "confirmed": ["type": "boolean"]]],
+        [
+            "type": "object",
+            "properties": ["name": ["type": "string", "default": "Ada"], "confirmed": ["type": "boolean", "default": false]],
+        ],
         ["type": "object", "properties": ["color": ["type": "string", "enum": ["blue", "green"]]]],
         titledEnumSchema,
     ]
@@ -62,7 +65,25 @@ struct IndependentElicitationAndStructuredOutputTests {
 
     private static let invalidSchemas: [JSONValue] = [
         ["type": "string"],
+        ["type": "object", "properties": ["name": ["type": "string", "default": 42]]],
+        [
+            "type": "object",
+            "properties": [
+                "colors": ["type": "array", "items": ["type": "string", "enum": ["blue", "green"]], "default": ["blue", 42]],
+            ],
+        ],
         ["type": "object", "properties": ["profile": ["type": "object", "properties": ["name": ["type": "string"]]]]],
+        [
+            "type": "object",
+            "properties": ["name": ["type": "string"]],
+            "allOf": [["properties": ["profile": ["type": "object", "properties": ["city": ["type": "string"]]]]]],
+        ],
+        [
+            "type": "object",
+            "properties": [
+                "name": ["type": "string", "not": ["type": "object", "properties": ["city": ["type": "string"]]]],
+            ],
+        ],
     ]
 
     private enum InputAPI: String, CaseIterable {
@@ -121,6 +142,53 @@ struct IndependentElicitationAndStructuredOutputTests {
         let server = try Self.formServer(api: api, schema: #require(schema.objectValue))
         let client = TestClient(server, capabilities: ["elicitation": ["form": [:]]])
         let reply = try await client.request("tools/call", ["name": "preferences"])
+        #expect(reply["error"] != nil || reply.r2pIsToolError, "\(reply)")
+        #expect(reply["result"]?["resultType"] != "input_required")
+        #expect(reply["result"]?["inputRequests"] == nil)
+        #expect(client.received.isEmpty)
+    }
+
+    private static let acceptedFormResponses: [(JSONValue, Bool)] = [
+        (["action": "accept", "content": [:]], true),
+        (["action": "accept", "content": ["extra": "flat"]], true),
+        (["action": "accept"], false),
+        (["action": "accept", "content": .null], false),
+        (["action": "accept", "content": ["extra": ["city": "Paris"]]], false),
+    ]
+
+    @Test(arguments: acceptedFormResponses)
+    func modernFormAcceptRequiresAnObjectWithFlatValues(response: JSONValue, accepted: Bool) async throws {
+        let server = try Self.formServer(api: .typed, schema: [
+            "type": "object",
+            "properties": ["name": ["type": "string"]],
+        ])
+        let client = TestClient(server, capabilities: ["elicitation": ["form": [:]]])
+        let initial = try await client.request("tools/call", ["name": "preferences"])
+        #expect(initial["result"]?["resultType"] == "input_required")
+        let state = try #require(initial["result"]?["requestState"])
+        let reply = try await client.request("tools/call", [
+            "name": "preferences",
+            "requestState": state,
+            "inputResponses": ["preferences": response],
+        ])
+        if accepted {
+            #expect(reply["result"]?["resultType"] == "complete")
+            #expect(reply.r2pText == "preferences received")
+        } else {
+            #expect(reply["error"] != nil || reply.r2pIsToolError, "\(reply)")
+            #expect(reply["result"]?["inputRequests"] == nil)
+        }
+    }
+
+    @Test(arguments: ["https:///connect", "https://example.com/%zz"])
+    func invalidModernURLFailsWithoutRequestingInput(url: String) async throws {
+        let server = R2P.server()
+        try server.register(tool: ToolDefinition(name: "connect")) { _, context in
+            _ = try await context.elicit("connect", message: "Connect your account?", url: url)
+            return .text("connection requested")
+        }
+        let client = TestClient(server, capabilities: ["elicitation": ["url": [:]]])
+        let reply = try await client.request("tools/call", ["name": "connect"])
         #expect(reply["error"] != nil || reply.r2pIsToolError, "\(reply)")
         #expect(reply["result"]?["resultType"] != "input_required")
         #expect(reply["result"]?["inputRequests"] == nil)

@@ -225,7 +225,9 @@ public final class RequestContext: Sendable {
             switch elicitation.mode {
             case .form(let schema):
                 guard schema["type"] == "object",
+                    schema.allSatisfy({ ["$schema", "type", "properties", "required"].contains($0.key) }),
                     let fields = (schema["properties"] ?? [:]).objectValue,
+                    (schema["required"]?.arrayValue ?? []).allSatisfy({ $0.stringValue.map(fields.contains) == true }),
                     fields.allSatisfy({ entry in entry.value.objectValue.map(isElicitationField) == true })
                 else {
                     throw .internalError("the requested schema of \"\(key)\" must be a flat elicitation form")
@@ -236,7 +238,9 @@ public final class RequestContext: Sendable {
                     throw .internalError("the requested schema of \"\(key)\" cannot be enforced: \(error)")
                 }
             case .url(let url):
-                guard !url.utf8.contains(where: { $0 <= 0x20 }), URL(string: url)?.scheme != nil else {
+                guard let parsed = URL(string: url, encodingInvalidCharacters: false), let scheme = parsed.scheme,
+                    !["http", "https"].contains(scheme.lowercased()) || parsed.host?.isEmpty == false
+                else {
                     throw .internalError("the URL for elicitation \"\(key)\" must be absolute")
                 }
             }
@@ -245,33 +249,68 @@ public final class RequestContext: Sendable {
     }
 
     private func isElicitationField(_ field: JSONObject) -> Bool {
+        func uses(_ object: JSONObject, _ keywords: Set<String>) -> Bool {
+            object.allSatisfy { keywords.contains($0.key) }
+        }
         func strings(_ value: JSONValue?) -> Bool {
             guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
             return choices.allSatisfy { $0.stringValue != nil }
         }
+        if let value = field["default"] {
+            let matches: Bool
+            switch (field["type"]?.stringValue, value) {
+            case ("string", .string), ("number", .number), ("boolean", .bool): matches = true
+            case ("integer", .number(let number)): matches = number.isInteger
+            case ("array", .array(let values)): matches = values.allSatisfy { $0.stringValue != nil }
+            default: matches = false
+            }
+            guard matches else { return false }
+        }
         func titledChoices(_ value: JSONValue?) -> Bool {
             guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
-            return choices.allSatisfy { $0["const"]?.stringValue != nil && $0["title"]?.stringValue != nil }
+            return choices.allSatisfy {
+                guard let choice = $0.objectValue, uses(choice, ["const", "title"]) else { return false }
+                return choice["const"]?.stringValue != nil && choice["title"]?.stringValue != nil
+            }
         }
+        let common: Set<String> = ["type", "title", "description", "default"]
         switch field["type"]?.stringValue {
         case "string":
-            if let choices = field["oneOf"] { return profile.urlElicitation && titledChoices(choices) }
-            return field["enum"] == nil || strings(field["enum"])
-        case "number", "integer", "boolean": return true
+            if let format = field["format"], !["email", "uri", "date", "date-time"].contains(format.stringValue ?? "") { return false }
+            if let choices = field["oneOf"] {
+                return profile.urlElicitation && uses(field, common.union(["oneOf"])) && titledChoices(choices)
+            }
+            if let choices = field["enum"] {
+                return uses(field, common.union(["enum", "enumNames"])) && strings(choices)
+                    && (field["enumNames"] == nil || strings(field["enumNames"]))
+            }
+            return uses(field, common.union(["minLength", "maxLength", "format"]))
+        case "number", "integer": return uses(field, common.union(["minimum", "maximum"]))
+        case "boolean": return uses(field, common)
         case "array":
-            guard profile.urlElicitation, let items = field["items"]?.objectValue else { return false }
-            if items["type"] == "string" { return strings(items["enum"]) }
-            return titledChoices(items["anyOf"])
+            guard profile.urlElicitation, uses(field, common.union(["items", "minItems", "maxItems"])),
+                let items = field["items"]?.objectValue else { return false }
+            if items["type"] == "string" { return uses(items, ["type", "enum"]) && strings(items["enum"]) }
+            return uses(items, ["anyOf"]) && titledChoices(items["anyOf"])
         default: return false
         }
     }
 
     private func validateFormAnswer(_ answer: InputResponse, for key: String, using validator: JSONSchema?) throws(MCPError) {
-        guard let validator, case .elicit(let result) = answer, result.action == .accept,
-            let violation = validator.validate(.object(result.content ?? JSONObject()))
-        else { return }
-        let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(violation)"
-        throw profile.multiRoundTrip ? .invalidParams(detail) : .internalError(detail)
+        guard let validator, case .elicit(let result) = answer, result.action == .accept else { return }
+        func invalid(_ reason: String) -> MCPError {
+            let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(reason)"
+            return profile.multiRoundTrip ? .invalidParams(detail) : .internalError(detail)
+        }
+        guard let content = result.content else { throw invalid("form acceptance requires content") }
+        for (_, value) in content {
+            switch value {
+            case .string, .number, .bool: break
+            case .array(let values) where profile.urlElicitation && values.allSatisfy({ $0.stringValue != nil }): break
+            default: throw invalid("form values must be primitives or supported string arrays")
+            }
+        }
+        if let violation = validator.validate(.object(content)) { throw invalid(violation.description) }
     }
 
     /// The capability `request` needs, if the client did not declare it or the revision lacks it.
