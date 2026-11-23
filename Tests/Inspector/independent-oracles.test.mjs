@@ -70,3 +70,25 @@ test('load rejects an unexpected reply even when all expected replies are presen
   const observed = [result(1, 'first'), result('1', 'unexpected')];
   assert.throws(() => assertLoadResponses(expected, observed), AssertionError);
 });
+
+const progress = (progressToken) => ({
+  jsonrpc: '2.0',
+  method: 'notifications/progress',
+  params: { progressToken, progress: 1 },
+});
+
+test('cancellation permits progress notifications with unrelated or differently typed tokens', () => {
+  assert.doesNotThrow(() => assertCancelledResponseAbsent([
+    progress(8),
+    result('sentinel', 'barrier reached'),
+    progress('7'),
+  ], 42, 7));
+});
+
+test('cancellation rejects matching progress even after the sentinel reply', () => {
+  assert.throws(() => assertCancelledResponseAbsent([
+    progress(7),
+    result('sentinel', 'barrier reached'),
+    progress('7'),
+  ], 42, '7'), AssertionError);
+});

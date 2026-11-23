@@ -83,6 +83,9 @@ for (const [name, change] of [
   ['wrong resultType for the modern revision', (trace) => {
     trace[5].message.result.resultType = 'partial';
   }],
+  ['explicit null isError in a tool result', (trace) => {
+    trace[5].message.result.isError = null;
+  }],
   ['missing response', (trace) => { trace.pop(); }],
   ['duplicate response', (trace) => {
     trace.push(response(41, 1, echoResult('inspector-load-1')));

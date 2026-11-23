@@ -8,12 +8,16 @@ function isRequestID(id) {
   return typeof id === "string" || Number.isSafeInteger(id);
 }
 
-export function assertCancelledResponseAbsent(frames, cancelledId) {
+export function assertCancelledResponseAbsent(frames, cancelledId, progressToken) {
   assert.ok(isRequestID(cancelledId), "Missing cancelled request ID");
   for (const frame of frames) {
     assert.ok(
       frame.id !== cancelledId || Object.hasOwn(frame, "method") || !hasResponseBody(frame),
       `Server replied to cancelled request ${JSON.stringify(cancelledId)}`,
+    );
+    assert.ok(
+      progressToken === undefined || frame.method !== "notifications/progress" || frame.params?.progressToken !== progressToken,
+      `Server sent progress for cancelled request ${JSON.stringify(cancelledId)}`,
     );
   }
 }

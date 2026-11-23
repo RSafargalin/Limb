@@ -80,7 +80,7 @@ export function checkWireLoad(trace, summary, { modern, mixed, minimumStartWindo
       if (modern) assert.equal(message.result.resultType, "complete");
       const result = {};
       for (const field of Object.keys(request.payload)) {
-        result[field] = field === "isError" ? (message.result.isError ?? false) : message.result[field];
+        result[field] = field === "isError" && !Object.hasOwn(message.result, field) ? false : message.result[field];
       }
       observed.push({ jsonrpc: message.jsonrpc, id, result });
       const latency = at - request.at;

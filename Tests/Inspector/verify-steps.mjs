@@ -19,12 +19,13 @@ export async function checkProgressAndCancellation(
   const cancellationFrames = [];
   let captureCancellation = false;
   let cancelledId;
+  let cancelledProgressToken;
   class ObservedTransport extends StdioClientTransport {
     async start() {
       const receive = this.onmessage;
       this.onmessage = (message, extra) => {
         if (captureCancellation) cancellationFrames.push(message);
-        receive?.(message, extra);
+        receive?.call(this, message, extra);
       };
       await super.start();
     }
@@ -34,6 +35,7 @@ export async function checkProgressAndCancellation(
           && message.params?.arguments?.mode === "cancel") {
         assert.equal(cancelledId, undefined, "Expected one cancellable call");
         cancelledId = message.id;
+        cancelledProgressToken = message.params._meta?.progressToken;
       }
       await super.send(message, options);
     }
@@ -110,8 +112,9 @@ export async function checkProgressAndCancellation(
     assert.equal(state, "cancelled", "The fixture should observe the cancellation notification");
     assertResult(await call("echo", { text: echoText }), echoText);
     assert.deepEqual(cancellationProgress, [{ progress: 1, total: 2, message: "started" }]);
-    assertCancelledResponseAbsent(cancellationFrames, cancelledId);
   } finally {
     await client.close();
   }
+  assert.ok(typeof cancelledProgressToken === "string" || Number.isSafeInteger(cancelledProgressToken), "Missing progress token used for the cancelled request");
+  assertCancelledResponseAbsent(cancellationFrames, cancelledId, cancelledProgressToken);
 }
