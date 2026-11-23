@@ -522,17 +522,23 @@ private struct Compiler {
     }()
 
     private func dialect(at uri: String) -> Dialect? {
-        if JSONSchema.supportedDialects.contains(uri) { return Dialect(isDraft7: uri.contains("draft-07")) }
-        return registeredDialects[ExactString(uri)]
+        let name = Self.schemaResourceName(uri)
+        if JSONSchema.supportedDialects.contains(name) { return Dialect(isDraft7: name.contains("draft-07")) }
+        return registeredDialects[ExactString(name)]
+    }
+
+    private static func schemaResourceName(_ uri: String) -> String {
+        guard let fragment = uri.firstIndex(of: "#"), uri.index(after: fragment) == uri.endIndex else { return uri }
+        return String(uri[..<fragment])
     }
 
     private static func registeredDialect(in meta: JSONValue) -> Dialect? {
-        guard meta["$schema"] == "https://json-schema.org/draft/2020-12/schema",
+        guard let schema = meta["$schema"]?.stringValue,
+            schemaResourceName(schema) == "https://json-schema.org/draft/2020-12/schema",
             let declaration = meta["$vocabulary"]?.objectValue else { return nil }
         var active: Set<Vocabulary> = [.core]
         for (name, requirement) in declaration {
-            guard let uri = URL(string: name, encodingInvalidCharacters: false), uri.scheme != nil,
-                let required = requirement.boolValue else { return nil }
+            guard isNormalizedVocabularyURI(name), let required = requirement.boolValue else { return nil }
             if name.hasPrefix(Self.vocabularyBase), let known = Vocabulary(rawValue: String(name.dropFirst(Self.vocabularyBase.count))) {
                 active.insert(known)
             } else if required {
@@ -540,6 +546,34 @@ private struct Compiler {
             }
         }
         return Dialect(isDraft7: false, vocabularies: active)
+    }
+
+    /// The scheme-independent syntax normalization rules from RFC 3986 section 6.2.2.
+    private static func isNormalizedVocabularyURI(_ name: String) -> Bool {
+        guard let uri = URLComponents(string: name, encodingInvalidCharacters: false),
+            let scheme = uri.scheme, scheme == scheme.lowercased(),
+            uri.host.map({ $0 == $0.lowercased() }) ?? true,
+            !uri.percentEncodedPath.split(separator: "/").contains(where: { $0 == "." || $0 == ".." })
+        else { return false }
+
+        func upperHex(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 0x30...0x39: byte - 0x30
+            case 0x41...0x46: byte - 0x41 + 10
+            default: nil
+            }
+        }
+        var bytes = name.utf8.makeIterator()
+        while let byte = bytes.next() {
+            guard byte > 0x20, byte < 0x7F else { return false }
+            guard byte == 0x25 else { continue }
+            guard let high = bytes.next().flatMap(upperHex), let low = bytes.next().flatMap(upperHex) else { return false }
+            switch high << 4 | low {
+            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E: return false
+            default: break
+            }
+        }
+        return true
     }
 
     /// Indexes schema positions and named resources before references are followed. IDs are

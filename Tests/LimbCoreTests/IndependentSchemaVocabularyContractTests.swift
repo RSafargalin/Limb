@@ -190,7 +190,7 @@ import Testing
             ],
             "type": ["object", "boolean"],
         ]]
-        for uri in [retrieval, canonical] {
+        for uri in [retrieval, canonical, retrieval + "#", canonical + "#"] {
             let document: JSONValue = ["$schema": .string(uri), "type": "integer", "minimum": 2]
             let compiled = try JSONSchema(document, registeredSchemas: registry)
             #expect(compiled.validate(2) == nil)
@@ -199,6 +199,18 @@ import Testing
         }
         let unknown: JSONValue = ["$schema": "https://registry.example.test/dialects/missing", "type": "integer", "minimum": 2]
         #expect(throws: JSONSchemaError.self) { try JSONSchema(unknown, registeredSchemas: registry) }
+    }
+
+    @Test func emptyFragmentSelectsTheDefaultMetaSchemaResource() throws {
+        let schema = try JSONSchema(["$schema": "https://json-schema.org/draft/2020-12/schema#", "type": "integer"])
+        #expect(schema.validate(2) == nil)
+        #expect(schema.validate("2") != nil)
+        #expect(throws: JSONSchemaError.self) {
+            try JSONSchema(["$schema": "https://json-schema.org/draft/2020-12/schema#unknown", "type": "integer"])
+        }
+        #expect(throws: JSONSchemaError.self) {
+            try JSONSchema(["$schema": "http://json-schema.org/draft-07/schema##", "type": "integer"])
+        }
     }
 
     @Test
@@ -252,7 +264,7 @@ import Testing
         }
     }
 
-    @Test func optionalVocabularyStillNeedsAnAbsoluteURI() throws {
+    @Test func optionalVocabularyNeedsANormalizedAbsoluteURI() throws {
         let uri = "https://example.test/project-meta"
         func registry(_ optionalVocabulary: String) -> [String: JSONValue] {
             let vocabularies: JSONObject = [
@@ -266,10 +278,17 @@ import Testing
             ]]
         }
         let schema: JSONValue = ["$schema": .string(uri)]
-        let compiled = try JSONSchema(schema, registeredSchemas: registry("https://example.test/vocabulary"))
-        #expect(compiled.validate("oak") == nil)
-        #expect(throws: JSONSchemaError.self) {
-            try JSONSchema(schema, registeredSchemas: registry("relative/vocabulary"))
+        for valid in ["https://example.test/vocabulary", "https://example.test/Vocabulary%2FName"] {
+            let compiled = try JSONSchema(schema, registeredSchemas: registry(valid))
+            #expect(compiled.validate("oak") == nil)
+        }
+        for invalid in [
+            "relative/vocabulary", "HTTPS://example.test/vocabulary", "https://EXAMPLE.test/vocabulary",
+            "https://example.test/a/../vocabulary", "https://example.test/%76ocabulary", "https://example.test/Vocabulary%2fName",
+        ] {
+            #expect(throws: JSONSchemaError.self, "\(invalid)") {
+                try JSONSchema(schema, registeredSchemas: registry(invalid))
+            }
         }
     }
 
