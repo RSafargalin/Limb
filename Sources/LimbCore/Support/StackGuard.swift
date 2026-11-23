@@ -5,6 +5,10 @@ import Glibc
 #elseif canImport(Musl)
 import Musl
 #endif
+#if os(Linux)
+import CLimbPosix
+import CDispatch
+#endif
 
 /// Measures how much stack a recursive algorithm has used since it started.
 ///
@@ -61,13 +65,10 @@ struct StackGuard {
         let thread = pthread_self()
         let top = Int(bitPattern: pthread_get_stackaddr_np(thread))
         return pthread_get_stacksize_np(thread) - (top - here)
-        #elseif canImport(Glibc) || canImport(Musl)
-        var attributes = pthread_attr_t()
-        guard pthread_getattr_np(pthread_self(), &attributes) == 0 else { return nil }
-        defer { pthread_attr_destroy(&attributes) }
+        #elseif os(Linux)
         var low: UnsafeMutableRawPointer?
         var size = 0
-        guard pthread_attr_getstack(&attributes, &low, &size) == 0, let low else { return nil }
+        guard limb_thread_stack_bounds(&low, &size) == 0, let low else { return nil }
         return here - Int(bitPattern: low)
         #else
         return nil

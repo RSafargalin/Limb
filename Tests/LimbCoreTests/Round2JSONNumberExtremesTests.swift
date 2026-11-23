@@ -449,9 +449,11 @@ private func round2RandomTexts(_ count: Int, seed: UInt64) -> [String] {
 
 @Suite struct Round2JSONNumberExtremesTests {
     @Test func doubleValueOfALongTextDoesNotTrap() async {
-        // The limit itself: 16,384 bytes read, 16,385 do not.
+        #if canImport(Darwin)
+        // Darwin's standard library accepts 16,384 bytes and rejects 16,385.
         #expect(Double(String(repeating: "7", count: 16_384)) != nil)
         #expect(Double(String(repeating: "7", count: 16_385)) == nil)
+        #endif
         #expect(JSONNumber(lexeme: "1." + String(repeating: "0", count: 16_382))!.doubleValue == 1)
         await #expect(processExitsWith: .success) {
             precondition(JSONNumber(lexeme: "1." + String(repeating: "0", count: 16_383))!.doubleValue == 1)

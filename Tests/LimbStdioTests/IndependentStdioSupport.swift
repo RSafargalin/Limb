@@ -1,4 +1,13 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 import Limb
 import Synchronization
@@ -148,15 +157,15 @@ func independentStdioFixture(configure: (inout ServerConfiguration) -> Void = { 
         let tag = arguments["tag"]?.stringValue ?? "?"
         probe.started(tag)
         let end = ContinuousClock.now + .milliseconds(arguments["ms"]?.intValue ?? 0)
-        var noted = false
-        while ContinuousClock.now < end {
-            if Task.isCancelled {
-                if !noted { probe.cancelled(tag) }
-                noted = true
-                usleep(5000)
-            } else {
-                try? await Task.sleep(for: .milliseconds(5))
-            }
+        do {
+            try await Task.sleep(until: end, clock: .continuous)
+        } catch {
+            probe.cancelled(tag)
+            // Keep the handler active until its original deadline without occupying a
+            // cooperative executor thread that the transport needs for the grace timer.
+            await Task.detached {
+                try? await Task.sleep(until: end, clock: .continuous)
+            }.value
         }
         probe.finished(tag)
         return .text("stubborn \(tag)")
@@ -184,10 +193,16 @@ func independentStdioFixture(configure: (inout ServerConfiguration) -> Void = { 
 
 // MARK: - File descriptors
 
+#if canImport(Darwin)
+let independentStdioStreamSocket = SOCK_STREAM
+#elseif canImport(Glibc)
+let independentStdioStreamSocket = Int32(SOCK_STREAM.rawValue)
+#endif
+
 struct IndependentStdioDescriptorState: Equatable, CustomStringConvertible {
     var statusFlags: Int32
     var descriptorFlags: Int32
-    var device: Int32
+    var device: UInt64
     var inode: UInt64
 
     init?(_ descriptor: Int32) {
@@ -195,13 +210,17 @@ struct IndependentStdioDescriptorState: Equatable, CustomStringConvertible {
         let flags = fcntl(descriptor, F_GETFD)
         var info = stat()
         guard status != -1, flags != -1, fstat(descriptor, &info) == 0 else { return nil }
+        #if canImport(Darwin)
         // Darwin reports a kernel bookkeeping bit through F_GETFL, FWASWRITTEN (0x10000, XNU
         // bsd/sys/fcntl.h), which the kernel sets by itself on the first write to the open
         // file. It is not a flag anyone can set with fcntl, so it is left out of the comparison.
         statusFlags = status & ~0x10000
+        #else
+        statusFlags = status
+        #endif
         descriptorFlags = flags
-        device = info.st_dev
-        inode = info.st_ino
+        device = UInt64(truncatingIfNeeded: info.st_dev)
+        inode = UInt64(truncatingIfNeeded: info.st_ino)
     }
 
     var isNonBlocking: Bool { statusFlags & O_NONBLOCK != 0 }
@@ -223,6 +242,8 @@ func independentStdioOpenDescriptorCount() -> Int {
 }
 
 // MARK: - Threads
+
+#if canImport(Darwin)
 
 struct IndependentStdioThread: Equatable {
     var id: UInt64
@@ -331,6 +352,8 @@ func independentStdioSignalThreads(ids: Set<UInt64>, signal: Int32) -> Int {
     return reached
 }
 
+#endif
+
 // MARK: - The client's end of a session
 
 /// Drives one `Server.run(_:)` over file descriptors from the client's side.
@@ -378,7 +401,7 @@ final class IndependentStdioClient: @unchecked Sendable {
             readEnd = fromServer[0]
         case .socketpair:
             var sockets: [Int32] = [-1, -1]
-            precondition(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0)
+            precondition(socketpair(AF_UNIX, independentStdioStreamSocket, 0, &sockets) == 0)
             serverInput = sockets[1]
             serverOutput = sockets[1]
             writeEnd = sockets[0]
@@ -406,9 +429,10 @@ final class IndependentStdioClient: @unchecked Sendable {
     /// the main thread's open mask, so there signals do arrive.) `run` reaches the creation of
     /// its threads without suspending, that is on the thread that unblocked the signal.
     @discardableResult
-    func start(signals: Bool = false) -> Self {
-        let transport = StdioTransport(input: serverInput, output: serverOutput)
-        task = Task { [server, self] in
+    func start(signals: Bool = false, configureTransport: (inout StdioTransport) -> Void = { _ in }) -> Self {
+        var transport = StdioTransport(input: serverInput, output: serverOutput)
+        configureTransport(&transport)
+        task = Task { [server, self, transport] in
             if signals {
                 var set = sigset_t()
                 sigemptyset(&set)
@@ -442,6 +466,21 @@ final class IndependentStdioClient: @unchecked Sendable {
     @discardableResult
     func send(_ bytes: [UInt8], timeout: Double = 30, absorb: Bool = true) -> Bool {
         guard writeEnd >= 0 else { return false }
+        // A test client may still be sending when the server closes its input.
+        #if canImport(Darwin)
+        guard fcntl(writeEnd, F_SETNOSIGPIPE, 1) == 0 else { return false }
+        #elseif canImport(Glibc)
+        var brokenPipe = sigset_t()
+        sigemptyset(&brokenPipe)
+        sigaddset(&brokenPipe, SIGPIPE)
+        var previousMask = sigset_t()
+        guard pthread_sigmask(SIG_BLOCK, &brokenPipe, &previousMask) == 0 else { return false }
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+        var pending = sigset_t()
+        guard sigpending(&pending) == 0 else { return false }
+        let hadPendingBrokenPipe = sigismember(&pending, SIGPIPE) == 1
+        #endif
+
         let deadline = Date().addingTimeInterval(timeout)
         var offset = 0
         while offset < bytes.count {
@@ -450,8 +489,16 @@ final class IndependentStdioClient: @unchecked Sendable {
                 offset += written
                 continue
             }
-            if written < 0, errno == EINTR { continue }
-            guard written < 0, errno == EAGAIN else { return false }
+            let failure = errno
+            #if canImport(Glibc)
+            if written < 0, failure == EPIPE, !hadPendingBrokenPipe {
+                // Consume the signal from this write before restoring the caller's mask.
+                var noWait = timespec()
+                while sigtimedwait(&brokenPipe, nil, &noWait) == -1, errno == EINTR {}
+            }
+            #endif
+            if written < 0, failure == EINTR { continue }
+            guard written < 0, failure == EAGAIN else { return false }
             if Date() >= deadline { return false }
             var descriptors = [pollfd(fd: writeEnd, events: Int16(POLLOUT), revents: 0)]
             if absorb, readEnd >= 0, !sawEndOfOutput {
@@ -640,7 +687,7 @@ final class IndependentStdioClient: @unchecked Sendable {
     func closeInput() {
         guard writeEnd >= 0 else { return }
         if writeEnd == readEnd {
-            shutdown(writeEnd, SHUT_WR)
+            shutdown(writeEnd, Int32(SHUT_WR))
         } else {
             close(writeEnd)
             writeEnd = -1

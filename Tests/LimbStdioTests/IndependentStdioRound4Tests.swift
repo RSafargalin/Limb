@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Testing
@@ -7,11 +12,13 @@ private typealias Client = IndependentStdioClient
 
 /// A connected TCP pair over the loopback interface: the server's end and the client's.
 private func tcpPair() throws -> (server: Int32, client: Int32) {
-    let listener = socket(AF_INET, SOCK_STREAM, 0)
+    let listener = socket(AF_INET, independentStdioStreamSocket, 0)
     try #require(listener >= 0)
     defer { close(listener) }
     var address = sockaddr_in()
+    #if canImport(Darwin)
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    #endif
     address.sin_family = sa_family_t(AF_INET)
     address.sin_port = 0
     address.sin_addr.s_addr = in_addr_t(UInt32(0x7F00_0001).bigEndian)
@@ -21,14 +28,16 @@ private func tcpPair() throws -> (server: Int32, client: Int32) {
     try #require(listen(listener, 1) == 0)
     let named = withUnsafeMutablePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(listener, $0, &length) } }
     try #require(named == 0)
-    let client = socket(AF_INET, SOCK_STREAM, 0)
+    let client = socket(AF_INET, independentStdioStreamSocket, 0)
     try #require(client >= 0)
     let connected = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, length) } }
     try #require(connected == 0)
     let server = accept(listener, nil, nil)
     try #require(server >= 0)
+    #if canImport(Darwin)
     var on: Int32 = 1
     _ = setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    #endif
     return (server, client)
 }
 
@@ -58,6 +67,7 @@ private func client(_ server: Server, _ way: IndependentStdioWay, nonBlocking: B
     return client.start()
 }
 
+#if canImport(Darwin)
 private func threadsGone(_ ids: Set<UInt64>, within seconds: Double) -> Bool {
     let deadline = Date().addingTimeInterval(seconds)
     while true {
@@ -66,6 +76,7 @@ private func threadsGone(_ ids: Set<UInt64>, within seconds: Double) -> Bool {
         usleep(10_000)
     }
 }
+#endif
 
 /// The two kinds of meaning a time limit can have, as far as a test of a few seconds can tell.
 private func waitsNoticeably(_ seconds: Double) -> Bool { seconds >= 1 }
@@ -82,7 +93,11 @@ extension IndependentStdioTransportTests {
         /// The failed write comes during the grace period, and one of the handlers in flight
         /// ignores cancellation: it is still told to stop at once, and `run` does not wait for
         /// it longer than the second it gives such handlers.
+        #if os(Linux)
+        @Test(arguments: [IndependentStdioWay.pipes, .socketpair])
+        #else
         @Test(arguments: [IndependentStdioWay.pipes, .socketpair, .tcp])
+        #endif
         func aPeerGoneDuringTheGracePeriodCutsItShortEvenForAStubbornHandler(way: IndependentStdioWay) throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 60 }
             let client = try client(fixture.server, way)
@@ -93,8 +108,7 @@ extension IndependentStdioTransportTests {
             #expect(client.initialize() == "2025-11-25")
             #expect(client.call(1, "hold", #"{"tag":"held"}"#))
             #expect(client.call(2, "stubborn", #"{"ms":20000,"tag":"stubborn"}"#))
-            // Their answers are the writes that fail. Over TCP the first write after the peer
-            // closed still succeeds (the peer answers it with a reset); the second fails.
+            // The answers are written after the peer closes its reading end.
             #expect(client.call(3, "nap", #"{"ms":400,"tag":"late"}"#))
             #expect(client.call(4, "nap", #"{"ms":800,"tag":"later"}"#))
             #expect(fixture.probe.eventually(seconds: 10) { $0.startedTags.count == 4 })
@@ -182,14 +196,18 @@ extension IndependentStdioTransportTests {
                 $0.shutdownGraceSeconds = 60
                 $0.budgets.maxConcurrentHandlers = 4
             }
+            #if canImport(Darwin)
             let before = Set(independentStdioTransportThreads().map(\.id))
+            #endif
             let client = try client(fixture.server, way)
             defer {
                 fixture.probe.release()
                 client.tearDown()
             }
             #expect(client.initialize() == "2025-11-25")
+            #if canImport(Darwin)
             let threads = Set(independentStdioSessionThreads(startedAfter: before).map(\.id))
+            #endif
             switch point {
             case "midFrame":
                 #expect(client.call(1, "hold", #"{"tag":"bystander"}"#))
@@ -226,7 +244,9 @@ extension IndependentStdioTransportTests {
             let finished = Set(fixture.probe.finishedTags)
             #expect(Set(fixture.probe.cancelledTags) == Set(fixture.probe.startedTags.filter { !$0.hasPrefix("blob") && !finished.contains($0) }))
             #expect(fixture.log.all == [], "\(way) \(point): \(fixture.log.all)")
+            #if canImport(Darwin)
             #expect(threadsGone(threads, within: 5))
+            #endif
         }
 
         /// The same departures repeated, mid-frame, on every socket kind: the error the writer
@@ -254,6 +274,7 @@ extension IndependentStdioTransportTests {
 
         // MARK: 2. Retrying a full non-blocking output
 
+        #if canImport(Darwin)
         @Test(arguments: [false, true], [0.0, 0.001, 0.4, 5.0])
         func aBlockedNonBlockingWriterDoesNotSpin(socket: Bool, drain: Double) throws {
             let fixture = try independentStdioFixture { $0.outputDrainSeconds = drain }
@@ -285,6 +306,7 @@ extension IndependentStdioTransportTests {
             #expect(client.responses(to: Set(1...4), timeout: 30).count == 4)
             #expect(threadsGone(writer, within: 5))
         }
+        #endif
 
         // MARK: 4. Unusual time limits
 
@@ -368,6 +390,7 @@ extension IndependentStdioTransportTests {
 
         // MARK: 6. What a child process inherits
 
+        #if canImport(Darwin)
         /// A child process started during a session (with `posix_spawn`, which hands over every
         /// descriptor that is not close-on-exec; its table is read with `proc_pidinfo`) inherits none of the session's own descriptors.
         @Test func aChildProcessStartedDuringASessionInheritsNothingOfIt() throws {
@@ -408,6 +431,7 @@ extension IndependentStdioTransportTests {
             #expect(fresh.count == 3, "a session opened \(fresh.count) descriptors of its own")
             #expect(inherited == [], "a child process inherited the session's descriptors \(inherited.sorted())")
         }
+        #endif
     }
 }
 
@@ -417,27 +441,36 @@ extension IndependentStdioTransportTests {
 private func blockedNonBlockingSession(
     _ fixture: IndependentStdioFixture, socket: Bool, count: Int = 4, size: Int = 300_000
 ) throws -> (client: IndependentStdioClient, threads: Set<UInt64>) {
+    #if canImport(Darwin)
     let before = Set(independentStdioTransportThreads().map(\.id))
+    #endif
     let client = Client(fixture.server, channel: socket ? .socketpair : .pipes)
     independentStdioSetNonBlocking(client.serverOutput)
     client.start()
     #expect(client.initialize() == "2025-11-25")
+    #if canImport(Darwin)
     let threads = Set(independentStdioSessionThreads(startedAfter: before).map(\.id))
+    #else
+    let threads: Set<UInt64> = []
+    #endif
     for id in 1...count { #expect(client.send(Client.callLine(id, "blob", #"{"size":\#(size),"seed":\#(id)}"#), absorb: false)) }
     #expect(fixture.probe.eventually(seconds: 20) { $0.finishedTags.filter { $0.hasPrefix("blob") }.count >= count })
     usleep(150_000)
     return (client, threads)
 }
 
+#if canImport(Darwin)
 private func writerCPU(_ threads: Set<UInt64>, over seconds: Double) -> Double {
     let writer = Set(independentStdioTransportThreads().filter { threads.contains($0.id) && $0.name == "limb-stdio-writer" }.map(\.id))
     let start = independentStdioCPUSeconds(of: writer)
     usleep(useconds_t(seconds * 1e6))
     return independentStdioCPUSeconds(of: writer) - start
 }
+#endif
 
 extension IndependentStdioTransportTests {
     @Suite struct Round5 {
+        #if canImport(Darwin)
         @Test(arguments: [false, true], [0.0, 1e-6, 0.4, 3.0, 30.0, Double.infinity])
         func theWriterBehindAFullNonBlockingOutputCostsNothingInEveryPhase(socket: Bool, drain: Double) throws {
             let fixture = try independentStdioFixture {
@@ -474,8 +507,11 @@ extension IndependentStdioTransportTests {
             // Everything still arrives once the client reads, and the writer ends.
             #expect(client.responses(to: Set(1...4), timeout: 30).count == 4)
             #expect(client.stopped(within: 10))
+            #if canImport(Darwin)
             #expect(threadsGone(threads, within: 5))
+            #endif
         }
+        #endif
 
         /// Cancelling the task before, during and after draining, with the writer blocked behind
         /// a full non-blocking output: `run` returns (by the drain limit at the latest once
@@ -501,7 +537,9 @@ extension IndependentStdioTransportTests {
             #expect(client.stopped(within: 10), "\(when): run did not return")
             #expect(fixture.log.all.allSatisfy { $0.contains("did not read") }, "\(fixture.log.all)")
             #expect(client.responses(to: Set(1...4), timeout: 30).count == 4)
+            #if canImport(Darwin)
             #expect(threadsGone(threads, within: 5))
+            #endif
         }
 
         /// Thousands of sessions whose writer is behind a full non-blocking output when the input

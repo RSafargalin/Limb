@@ -5,6 +5,7 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/ci.sh [pr [<git-ref>]]  Run the test suite on the working tree or a local Git revision.
+  scripts/ci.sh pr-foundation [<git-ref>] Run the same checks with FoundationJSON.
   scripts/ci.sh release <git-ref> Run the release test suite on a local Git revision.
 EOF
 }
@@ -13,7 +14,7 @@ mode=${1:-pr}
 revision=${2:-}
 case "$mode" in
     -h|--help) usage; exit 0 ;;
-    pr|release) ;;
+    pr|pr-foundation|release) ;;
     *) usage >&2; exit 2 ;;
 esac
 if [[ $# -gt 2 || ( "$mode" == release && -z "$revision" ) ]]; then
@@ -64,6 +65,9 @@ if [[ "$mode" == release ]]; then
 
     printf '\nRelease tests with FoundationJSON\n'
     run_tests --configuration release --traits FoundationJSON
+elif [[ "$mode" == pr-foundation ]]; then
+    run_tests --traits FoundationJSON
+    run_isolated_stdio_tests --traits FoundationJSON
 else
     run_tests
     run_isolated_stdio_tests

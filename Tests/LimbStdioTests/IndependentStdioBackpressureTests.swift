@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Synchronization
@@ -131,6 +136,7 @@ extension IndependentStdioTransportTests {
             #expect(client.violations == [])
         }
 
+        #if canImport(Darwin)
         /// Waiting for the client must be a blocking wait on every kind of output, including
         /// one that somebody else made non-blocking (`write` then fails with EAGAIN instead of
         /// blocking, and retrying it in a loop would burn a core for as long as the client is slow).
@@ -155,6 +161,7 @@ extension IndependentStdioTransportTests {
             client.closeInput()
             #expect(client.stopped(within: 10))
         }
+        #endif
 
         @Test func handlersFeelBackpressureWhileTheClientDoesNotRead() throws {
             let fixture = try independentStdioFixture {
@@ -342,6 +349,7 @@ extension IndependentStdioTransportTests {
 
         // MARK: Signals
 
+        #if canImport(Darwin)
         @Test func signalsDeliveredToTheTransportThreadsDoNotDisturbTheSession() throws {
             independentStdioCountSIGUSR1()
             let handledBefore = independentStdioHandledSignals.load(ordering: .relaxed)
@@ -399,5 +407,6 @@ extension IndependentStdioTransportTests {
             #expect(fixture.log.all == [], "\(fixture.log.all)")
             #expect(client.violations == [])
         }
+        #endif
     }
 }

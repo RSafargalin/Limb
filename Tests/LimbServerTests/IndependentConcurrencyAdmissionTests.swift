@@ -25,6 +25,8 @@ struct IndependentConcurrencyAdmissionTests {
 
     @Test func parallelismLimitIsNeverExceededAndIsReached() async throws {
         let active = ICMeter()
+        let warmup = ICGate()
+        defer { warmup.open() }
         let server = independentConcurrencyServer { configuration in
             configuration.budgets.maxConcurrentHandlers = 3
             configuration.budgets.maxQueuedRequests = 10_000
@@ -43,7 +45,23 @@ struct IndependentConcurrencyAdmissionTests {
             await Task.yield()
             return []
         }
+        try server.register(tool: ToolDefinition(name: "warmup")) { _, _ in
+            active.enter()
+            defer { active.leave() }
+            await warmup.wait()
+            return .text("ready")
+        }
         let wire = ICWire(server)
+        var warmupIDs = Set((0..<3).map { _ in wire.call("warmup") })
+        try #require(await independentConcurrencyEventually { warmup.waiting == 3 }, "three handlers never reached the gate")
+        warmup.open()
+        for _ in 0..<3 {
+            let message = try await wire.next()
+            let id = try #require(message["id"].flatMap(RequestID.init(json:)))
+            try #require(warmupIDs.remove(id) != nil)
+            #expect(message["result"]?["content"]?[0]?["text"] == "ready")
+        }
+
         let total = 600
         var cancelled: Set<RequestID> = []
         for index in 0..<total {
@@ -65,8 +83,6 @@ struct IndependentConcurrencyAdmissionTests {
         }
         #expect(await independentConcurrencyEventually { active.current == 0 })
         #expect(active.peak <= 3, "\(active.peak) handlers ran at once with a limit of 3")
-        // The measurement is not vacuous: the limit was actually reached.
-        #expect(active.peak == 3)
     }
 
     /// `ExecutionMode.serial`: "One at a time, in arrival order: for code that is not safe to run
