@@ -72,6 +72,8 @@ public struct CompletionRequest: Sendable {
 public typealias CompletionHandler = @Sendable (_ request: CompletionRequest, _ context: RequestContext) async throws -> CompletionResult
 
 /// Handles a method the typed API does not cover: raw params in, raw result out.
+/// In `2026-07-28`, the result is `complete`. Supply that discriminator explicitly or leave
+/// it to Limb. Other values produce a JSON-RPC internal error.
 public typealias MethodHandler = @Sendable (_ params: JSONObject, _ context: RequestContext) async throws -> JSONObject
 
 /// Why a registration was refused.
