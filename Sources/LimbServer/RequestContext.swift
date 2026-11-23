@@ -109,6 +109,8 @@ public final class RequestContext: Sendable {
     /// be asked for again: in `2026-07-28` the second question would receive the first one's
     /// answer, so it is an error in every revision. A question that got no answer (one that
     /// timed out) may be asked again.
+    /// An answer accepted in an earlier round stays associated with its key until the operation
+    /// ends, even if a later run does not read it. Use a new key when asking a different question.
     ///
     /// In legacy revisions a request the client leaves unanswered for
     /// `ServerConfiguration.clientRequestTimeoutSeconds` is withdrawn, and this call throws
@@ -353,6 +355,7 @@ final class InputState: Sendable {
     /// Answers available to this run: earlier rounds' (from `requestState`) and this round's.
     let answers: JSONObject
     let fingerprint: String
+    let version: RequestStatePayload.Version
 
     private struct Progress {
         /// Requests the handler asked for and has no answer to.
@@ -371,10 +374,15 @@ final class InputState: Sendable {
 
     private let progress = Mutex(Progress())
 
-    init(allowed: Bool, answers: JSONObject = JSONObject(), fingerprint: String = "") {
+    init(
+        allowed: Bool, answers: JSONObject = JSONObject(), journal: JSONObject = JSONObject(), fingerprint: String = "",
+        version: RequestStatePayload.Version = .exact
+    ) {
         self.allowed = allowed
         self.answers = answers
         self.fingerprint = fingerprint
+        self.version = version
+        progress.withLock { $0.journal = journal }
     }
 
     static let unavailable = InputState(allowed: false)

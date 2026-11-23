@@ -244,7 +244,14 @@ public final class Server: Sendable {
     /// Creates the protocol engine for one connection. Transports call this; `sink` receives
     /// every outgoing frame.
     public func connect(to sink: any FrameSink) -> Connection {
-        let connection = Connection(server: self, sink: sink)
+        connect(to: sink, authenticatedPrincipal: nil)
+    }
+
+    /// Connects a transport that has already authenticated a principal. The transport supplies
+    /// its stable principal identifier for the lifetime of the connection. Multi-round request
+    /// state is then bound to that principal across reconnections and workers using the same key.
+    public func connect(to sink: any FrameSink, authenticatedPrincipal: String?) -> Connection {
+        let connection = Connection(server: self, sink: sink, authenticatedPrincipal: authenticatedPrincipal)
         connections.withLock { $0.insert(connection) }
         return connection
     }

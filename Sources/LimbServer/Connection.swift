@@ -27,12 +27,14 @@ public final class Connection: Sendable {
     let server: Server
     let sink: any FrameSink
     private let configuration: ServerConfiguration
+    private let authenticatedPrincipal: String?
     private let state = Mutex(State())
 
-    init(server: Server, sink: any FrameSink) {
+    init(server: Server, sink: any FrameSink, authenticatedPrincipal: String?) {
         self.server = server
         self.sink = sink
         configuration = server.configuration
+        self.authenticatedPrincipal = authenticatedPrincipal
     }
 
 
@@ -722,7 +724,8 @@ public final class Connection: Sendable {
             cache = matched.cache ?? cache
         }
         let request = ResourceRequest(uri: uri, variables: variables)
-        let policy = cache
+        let isContinuation = peer.profile.multiRoundTrip && (params.contains("requestState") || params.contains("inputResponses"))
+        let policy = isContinuation ? CachePolicy(ttlMilliseconds: 0, scope: .private) : cache
         admit(id: id, method: "resources/read", detail: uri, bytes: bytes, responder: responder) { [self] serial in
             let input: InputState
             do throws(MCPError) {
@@ -986,32 +989,42 @@ public final class Connection: Sendable {
         method: String, target: String, arguments: JSONValue, params: JSONObject, peer: Peer
     ) throws(MCPError) -> InputState {
         guard peer.profile.multiRoundTrip else { return InputState(allowed: true) }
-        var answers = JSONObject()
+        var journal = JSONObject()
         // Checked before anything is merged: only the keys the handler asks for matter, and a
         // handler asks for a handful.
         let limit = configuration.budgets.maxInputResponses
         if case .object(let responses) = params["inputResponses"], responses.count > limit {
             throw MCPError.invalidParams("inputResponses: more than \(limit) entries")
         }
-        let fingerprint = requestFingerprint(method: method, target: target, arguments: arguments)
-        if let stateValue = params["requestState"], !stateValue.isNull {
+        let version: RequestStatePayload.Version = authenticatedPrincipal == nil ? .exact : .principalBound
+        let fingerprint = requestFingerprint(method: method, target: target, arguments: arguments, version: version,
+            principal: authenticatedPrincipal)
+        if let stateValue = params["requestState"] {
             // The state came back through the client: verify before anything reads it.
             guard let sealed = stateValue.stringValue else { throw MCPError.invalidParams("requestState: expected string") }
             guard let opened = try? server.sealer.open(sealed), let payload = RequestStatePayload(opened) else {
                 throw MCPError.invalidParams("requestState: failed verification")
             }
             guard payload.expires >= unixTime() else { throw MCPError.invalidParams("requestState: expired") }
-            guard payload.fingerprint == fingerprint else {
+            guard (payload.version == .principalBound) == (version == .principalBound) else {
                 throw MCPError.invalidParams("requestState: issued for a different request")
             }
-            answers = payload.journal
+            let expected = payload.version == .legacy
+                ? requestFingerprint(method: method, target: target, arguments: arguments, version: .legacy)
+                : fingerprint
+            guard payload.fingerprint == expected else {
+                throw MCPError.invalidParams("requestState: issued for a different request")
+            }
+            journal = payload.journal
         }
+        var answers = journal
         switch params["inputResponses"] {
-        case .none, .some(.null): break
-        case .some(.object(let responses)): answers = answers.merging(responses)
+        case .none: break
+        case .some(.object(let responses)):
+            for (key, answer) in responses where answers[key] == nil { answers[key] = answer }
         case .some(let other): throw MCPError.invalidParams("inputResponses: expected object, got \(other.typeName)")
         }
-        return InputState(allowed: true, answers: answers, fingerprint: fingerprint)
+        return InputState(allowed: true, answers: answers, journal: journal, fingerprint: fingerprint, version: version)
     }
 
     /// If the run asked for input it did not have, the response is an `InputRequiredResult`,
@@ -1032,7 +1045,7 @@ public final class Connection: Sendable {
         let (expires, overflow) = unixTime().addingReportingOverflow(configuration.requestStateLifetimeSeconds)
         let payload = RequestStatePayload(
             expires: overflow ? .max : expires,
-            fingerprint: context.inputState.fingerprint, journal: outstanding.journal)
+            fingerprint: context.inputState.fingerprint, journal: outstanding.journal, version: context.inputState.version)
         let plaintext = payload.encoded()
         guard plaintext.count <= configuration.maxRequestStateBytes else {
             // Earlier answers travel in the state; past the limit they are not carried further.

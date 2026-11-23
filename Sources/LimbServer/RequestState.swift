@@ -106,6 +106,13 @@ public struct AEADRequestStateSealer: RequestStateSealer {
 
 /// What a sealed `requestState` carries between rounds.
 struct RequestStatePayload {
+    enum Version: Int {
+        case legacy = 1
+        case exact = 2
+        case principalBound = 3
+    }
+
+    var version: Version
     /// Unix time after which the state is refused.
     var expires: Int
     /// Identifies the request the state was issued for, so it cannot be replayed on another one.
@@ -117,7 +124,7 @@ struct RequestStatePayload {
     func encoded() -> [UInt8] {
         var writer = JSONWriter()
         writer.beginObject()
-        writer.field("v", 1)
+        writer.field("v", version.rawValue)
         writer.field("exp", expires)
         writer.field("fp", fingerprint)
         writer.field("j", journal)
@@ -125,49 +132,63 @@ struct RequestStatePayload {
         return writer.bytes
     }
 
-    init(expires: Int, fingerprint: String, journal: JSONObject) {
+    init(expires: Int, fingerprint: String, journal: JSONObject, version: Version = .exact) {
+        self.version = version
         self.expires = expires
         self.fingerprint = fingerprint
         self.journal = journal
     }
 
     init?(_ bytes: [UInt8]) {
-        guard let value = try? JSON.parse(bytes), value["v"] == 1,
+        guard let value = try? JSON.parse(bytes), let rawVersion = value["v"]?.intValue,
+            let version = Version(rawValue: rawVersion),
             let expires = value["exp"]?.intValue, let fingerprint = value["fp"]?.stringValue,
             let journal = value["j"]?.objectValue
         else { return nil }
-        self.init(expires: expires, fingerprint: fingerprint, journal: journal)
+        self.init(expires: expires, fingerprint: fingerprint, journal: journal, version: version)
     }
 }
 
 /// A digest of what identifies a request across its rounds: the method, the thing addressed and
 /// its arguments. `_meta` is excluded on purpose: progress tokens and trace context legitimately
 /// change between rounds.
-func requestFingerprint(method: String, target: String, arguments: JSONValue) -> String {
+func requestFingerprint(
+    method: String, target: String, arguments: JSONValue, version: RequestStatePayload.Version = .exact,
+    principal: String? = nil
+) -> String {
     var writer = JSONWriter()
     writer.beginArray()
     writer.write(method)
     writer.write(target)
-    writeCanonical(arguments, to: &writer)
+    writeCanonical(arguments, to: &writer, version: version)
+    if version == .principalBound { writer.write(principal.map(JSONValue.string) ?? .null) }
     writer.endArray()
     let digest = SHA256.hash(data: writer.bytes)
     return Base64.encode(Array(digest), urlSafe: true)
 }
 
 /// Object members in sorted order, so equal values hash equally however the client ordered them.
-private func writeCanonical(_ value: JSONValue, to writer: inout JSONWriter) {
+private func writeCanonical(_ value: JSONValue, to writer: inout JSONWriter, version: RequestStatePayload.Version) {
     switch value {
     case .object(let object):
         writer.beginObject()
-        for (key, member) in object.sorted(by: { $0.key < $1.key }) {
+        let fields = object.sorted {
+            switch version {
+            case .legacy: $0.key < $1.key
+            case .exact, .principalBound: $0.key.utf8.lexicographicallyPrecedes($1.key.utf8)
+            }
+        }
+        for (key, member) in fields {
             writer.key(key)
-            writeCanonical(member, to: &writer)
+            writeCanonical(member, to: &writer, version: version)
         }
         writer.endObject()
     case .array(let array):
         writer.beginArray()
-        for element in array { writeCanonical(element, to: &writer) }
+        for element in array { writeCanonical(element, to: &writer, version: version) }
         writer.endArray()
+    case .number(let number) where version != .legacy:
+        writer.write(number.canonicalDecimal)
     default:
         writer.write(value)
     }
