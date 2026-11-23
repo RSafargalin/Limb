@@ -19,6 +19,21 @@ import Testing
         #expect(generous.validate(deepCheck.invalidInstance)?.reason != Self.budgetReason)
     }
 
+    @Test func uniqueItemsChargesEqualityAfterHashingBothItems() throws {
+        let first: JSONValue = ["amount": [1]]
+        let distinct: JSONValue = ["amount": [2]]
+        let equivalent: JSONValue = ["amount": [try Self.number("1.0")]]
+        let constraint: JSONValue = ["uniqueItems": true]
+        let tight = try JSONSchema(constraint, limits: Self.limits(8))
+        let generous = try JSONSchema(constraint, limits: Self.limits(128))
+
+        // The budget covers the schema visit and both three-node hashes. It cannot
+        // also cover the three-node equality check needed for the duplicate.
+        #expect(tight.validate([first, distinct]) == nil)
+        #expect(tight.validate([first, equivalent])?.reason == Self.budgetReason)
+        #expect(generous.validate([first, equivalent])?.reason == "items must be unique")
+    }
+
     @Test(arguments: ["not", "anyOf"])
     func compositionPropagatesStructuralBudgetExhaustion(keyword: String) throws {
         let value = Self.nested(1)

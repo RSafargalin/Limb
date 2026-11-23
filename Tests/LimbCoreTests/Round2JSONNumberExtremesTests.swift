@@ -2,6 +2,10 @@ import LimbCore
 import Testing
 #if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
 #endif
 
 
@@ -158,6 +162,14 @@ private let round2Bounds = [
     "9223372036854775807", "1e9999999999999999999", "-1e-9999999999999999999",
 ]
 
+private func round2SchemaSupports(_ model: Round2Model) -> Bool {
+    (-round2Bound...round2Bound).contains(model.exponent)
+}
+
+private func round2IsExponentRefusal(_ reason: String?) -> Bool {
+    reason?.lowercased().contains("exponent") == true
+}
+
 /// The numbers a text gives in each storage.
 private func round2Storages(_ text: String) -> [(JSONNumber, String)] {
     let lexeme = JSONNumber(lexeme: text)!
@@ -174,10 +186,28 @@ private func round2Check(_ texts: [String], pairs: Bool) -> [String] {
     func note(_ text: String) {
         if problems.count < 30 { problems.append(text.count > 300 ? String(text.prefix(300)) + "…" : text) }
     }
-    let divisors = round2Divisors.map { (try! JSONSchema(["multipleOf": .number(JSONNumber(lexeme: $0)!)]), Round2Model($0), $0) }
-    let ceiling = JSONNumber(lexeme: "1e4000000000000000000")!
-    let bounds = round2Bounds.map {
-        (try! JSONSchema(["minimum": .number(JSONNumber(lexeme: $0)!), "exclusiveMaximum": .number(ceiling)]), Round2Model($0), $0)
+    func compileOperand(_ key: String, _ text: String, additional: JSONObject = [:]) -> (JSONSchema, Round2Model, String)? {
+        let model = Round2Model(text)
+        var definition = additional
+        definition[key] = .number(JSONNumber(lexeme: text)!)
+        do {
+            let schema = try JSONSchema(.object(definition))
+            if round2SchemaSupports(model) { return (schema, model, text) }
+            note("\(key) \(text): compiled outside the numeric domain")
+        } catch {
+            if round2SchemaSupports(model) || !round2IsExponentRefusal(error.reason) {
+                note("\(key) \(text): \(error.reason)")
+            }
+        }
+        return nil
+    }
+    let divisors = round2Divisors.compactMap { compileOperand("multipleOf", $0) }
+    _ = compileOperand("exclusiveMaximum", "1e4000000000000000000")
+    let ceiling = "2e999999999999999999"
+    let ceilingValue = JSONValue.number(JSONNumber(lexeme: ceiling)!)
+    let ceilingModel = Round2Model(ceiling)
+    let bounds = round2Bounds.compactMap {
+        compileOperand("minimum", $0, additional: ["exclusiveMaximum": ceilingValue])
     }
     var all: [(JSONNumber, Round2Model, String)] = []
     for text in texts {
@@ -202,13 +232,21 @@ private func round2Check(_ texts: [String], pairs: Bool) -> [String] {
             if number != number || number < number { note("\(label): not reflexive") }
             // Megabyte texts against three divisors only: each check reads every digit.
             for (schema, divisor, divisorText) in spelled.utf8.count > 100_000 ? Array(divisors.prefix(3)) : divisors {
-                let accepted = schema.validate(.number(number)) == nil
-                if accepted != model.isMultiple(of: divisor) { note("\(label) multipleOf \(divisorText): \(accepted)") }
+                let violation = schema.validate(.number(number))
+                if round2SchemaSupports(model) {
+                    if (violation == nil) != model.isMultiple(of: divisor) { note("\(label) multipleOf \(divisorText): \(String(describing: violation))") }
+                } else if !round2IsExponentRefusal(violation?.reason) {
+                    note("\(label) multipleOf \(divisorText): expected exponent refusal")
+                }
             }
             for (schema, bound, boundText) in bounds {
-                let accepted = schema.validate(.number(number)) == nil
-                let expected = Round2Model.compare(model, bound) >= 0 && Round2Model.compare(model, Round2Model("1e4000000000000000000")) < 0
-                if accepted != expected { note("\(label) minimum \(boundText): \(accepted)") }
+                let violation = schema.validate(.number(number))
+                if round2SchemaSupports(model) {
+                    let expected = Round2Model.compare(model, bound) >= 0 && Round2Model.compare(model, ceilingModel) < 0
+                    if (violation == nil) != expected { note("\(label) minimum \(boundText): \(String(describing: violation))") }
+                } else if !round2IsExponentRefusal(violation?.reason) {
+                    note("\(label) minimum \(boundText): expected exponent refusal")
+                }
             }
         }
     }
@@ -248,7 +286,15 @@ private func round2Check(_ texts: [String], pairs: Bool) -> [String] {
 private func round2SchemaMagnitudeProblems() -> [String] {
     var problems: [String] = []
     func n(_ text: String) -> JSONValue { .number(JSONNumber(lexeme: text)!) }
-    // A count beyond Int means Int.max: bounds nothing.
+    func expectExponentRefusal(_ key: String, _ text: String) {
+        do {
+            _ = try JSONSchema([key: n(text)])
+            problems.append("\(key) \(text) compiled")
+        } catch {
+            if !round2IsExponentRefusal(error.reason) { problems.append("\(key) \(text): \(error.reason)") }
+        }
+    }
+    // Integral counts beyond Int saturate to Int.max.
     for text in ["1e9999999999999999999", "18446744073709551616", "9223372036854775808", "1e400", "4e4000000000000000000"] {
         for key in ["maxLength", "maxItems", "maxProperties"] {
             guard let schema = try? JSONSchema([key: n(text)]) else { problems.append("\(key) \(text) refused"); continue }
@@ -265,15 +311,12 @@ private func round2SchemaMagnitudeProblems() -> [String] {
         if (try? JSONSchema(["maxLength": n(text)])) != nil { problems.append("maxLength \(text) compiled") }
     }
     if (try? JSONSchema(["maxLength": n("-0")])) == nil { problems.append("maxLength -0 refused") }
-    // multipleOf: zero and negatives refused, 20 significant digits refused, clamped values compile.
+    // multipleOf requires a positive divisor within the exponent and significant-digit limits.
     for text in ["0", "-0e9999999999999999999", "-3", "-1e-9999999999999999999", "12345678901234567891"] {
         if (try? JSONSchema(["multipleOf": n(text)])) != nil { problems.append("multipleOf \(text) compiled") }
     }
     for text in ["1e-9999999999999999999", "1e9999999999999999999", "9999999999999999999e-4000000000000000000"] {
-        guard let schema = try? JSONSchema(["multipleOf": n(text)]) else { problems.append("multipleOf \(text) refused"); continue }
-        _ = schema.validate(n("1e9999999999999999999"))
-        _ = schema.validate(n("-1e-9999999999999999999"))
-        _ = schema.validate(n("7"))
+        expectExponentRefusal("multipleOf", text)
     }
     // Negative and huge limits: no trap; a negative step budget fails closed.
     var limits = JSONSchema.Limits()
@@ -298,7 +341,8 @@ private func round2CheckMegabytes() -> [String] {
     let digits = 4 * 1024 * 1024
     let sevens = String(repeating: "7", count: digits)
     let one = JSONNumber(lexeme: "1")!
-    let integerSchema = try! JSONSchema(["type": "integer", "multipleOf": 1])
+    let integerSchema = try! JSONSchema(["type": "integer"])
+    let multipleSchema = try! JSONSchema(["multipleOf": 1])
     var problems: [String] = []
     let cases: [(String, Int)] = [
         // text, expected sign of comparison with 1e(10^18) clamped (1 = above or merged? no: -1 below, 0 merged)
@@ -316,7 +360,14 @@ private func round2CheckMegabytes() -> [String] {
         if number.isInteger != model.isInteger { problems.append("\(label): isInteger") }
         if number.int64Value != model.int64 { problems.append("\(label): int64Value") }
         if (number == one) != (Round2Model.compare(model, Round2Model("1")) == 0) { problems.append("\(label): == 1") }
-        if (integerSchema.validate(.number(number)) == nil) != model.isInteger { problems.append("\(label): integer schema") }
+        let value = JSONValue.number(number)
+        if (integerSchema.validate(value) == nil) != model.isInteger { problems.append("\(label): integer schema") }
+        let violation = multipleSchema.validate(value)
+        if round2SchemaSupports(model) {
+            if (violation == nil) != model.isInteger { problems.append("\(label): multipleOf schema") }
+        } else if !round2IsExponentRefusal(violation?.reason) {
+            problems.append("\(label): multipleOf schema expected exponent refusal")
+        }
         if expected == 0, number.hashValue != huge.hashValue { problems.append("\(label): merged but hashes differently") }
         if JSONNumber(lexeme: JSONValue.number(number).description) != number { problems.append("\(label): writer") }
     }

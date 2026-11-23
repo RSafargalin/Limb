@@ -252,15 +252,38 @@ final class Evaluation {
         }
     }
 
-    /// Hashing a value for `uniqueItems` visits every member, even if the set is empty.
-    func chargeHash(of value: JSONValue) -> Bool {
+    /// Hashing a value for `uniqueItems` visits every member. The caller separately charges
+    /// full equality checks for values that share a hash.
+    func hash(_ value: JSONValue) -> Int? {
+        var hasher = Hasher()
+        return hash(value, into: &hasher) ? hasher.finalize() : nil
+    }
+
+    private func hash(_ value: JSONValue, into hasher: inout Hasher) -> Bool {
         guard step(), !stack.isExhausted else { return false }
         switch value {
-        case .array(let values): return values.allSatisfy(chargeHash)
-        case .object(let object): return object.allSatisfy { chargeHash(of: $0.value) }
-        case .number(let number): return accepts(number)
-        default: return true
+        case .array(let values):
+            hasher.combine(0)
+            hasher.combine(values.count)
+            for child in values where !hash(child, into: &hasher) { return false }
+        case .object(let object):
+            hasher.combine(1)
+            hasher.combine(object.count)
+            var combined = 0
+            for (key, child) in object {
+                var member = Hasher()
+                member.combine(ExactString(key))
+                guard hash(child, into: &member) else { return false }
+                combined &+= member.finalize()
+            }
+            hasher.combine(combined)
+        case .number(let number):
+            guard accepts(number) else { return false }
+            hasher.combine(value)
+        default:
+            hasher.combine(value)
         }
+        return true
     }
 
     /// Whether `pattern` matches `string`; `nil` once the pattern budget is spent.
@@ -1247,17 +1270,6 @@ extension JSONSchema {
         return depth <= 8 ? value.description : "a value nested \(depth) levels deep"
     }
 
-    /// Whether the stack that is left can hold a comparison or a hash of `value`.
-    ///
-    /// Both recurse once per level of the value, and nothing inside them can stop: `==` and
-    /// `hash(into:)` have no way to fail. So the depth is measured first (without recursion) and
-    /// a value too deep for the remaining stack is reported as a violation instead of crashing.
-    /// The cost per level is the largest observed in an unoptimized build, rounded up.
-    private func canCompare(_ value: JSONValue) -> Bool {
-        guard value.isContainer, let remaining = StackGuard.remaining else { return true }
-        return value.nestingDepth * 1536 + 16 * 1024 <= remaining
-    }
-
     private func checkArray(
         _ node: Node, _ array: [JSONValue], _ recursion: Int, _ run: Evaluation, _ locations: EvaluatedLocations?
     ) -> SchemaViolation? {
@@ -1289,12 +1301,21 @@ extension JSONSchema {
             }
         }
         if node.uniqueItems {
-            guard array.allSatisfy(run.chargeHash) else { return fail("the schema could not compare all array items") }
-            guard canCompare(.array(array)) else {
-                run.stack.noteExhausted()
-                return fail("nested too deeply to compare on the stack that is left")
+            var mostRecent: [Int: Int] = [:]
+            var preceding: [Int?] = []
+            for (index, value) in array.enumerated() {
+                guard let hash = run.hash(value) else { return fail("the schema could not compare all array items") }
+                let previous = mostRecent.updateValue(index, forKey: hash)
+                preceding.append(previous)
+                var collision = previous
+                while let candidate = collision {
+                    if run.equal(array[candidate], value) { return fail("items must be unique") }
+                    guard !run.isOverBudget, !run.stack.wasExhausted, !run.comparedUnsupportedNumber else {
+                        return fail("the schema could not compare all array items")
+                    }
+                    collision = preceding[candidate]
+                }
             }
-            if Set(array).count != array.count { return fail("items must be unique") }
         }
         return nil
     }

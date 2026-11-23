@@ -115,6 +115,9 @@ public struct ServerConfiguration: Sendable {
     /// Items per page of a list result; `nil` returns everything in one page.
     public var pageSize: Int?
     public var parseOptions = JSONParseOptions()
+    /// In-memory tool schema documents keyed by absolute URI. Unresolved references fail
+    /// registration. URI resolution performs no I/O.
+    public var schemaResources: [String: JSONValue] = [:]
     /// How long `requestState` stays valid. Elicitation waits for a person, hence minutes.
     public var requestStateLifetimeSeconds = 900
     /// The most a `requestState` may hold before sealing. Answers from earlier rounds travel in

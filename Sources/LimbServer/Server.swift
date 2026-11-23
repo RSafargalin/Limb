@@ -91,8 +91,10 @@ public final class Server: Sendable {
         let input: JSONSchema
         var output: JSONSchema?
         do {
-            input = try JSONSchema(.object(definition.inputSchema))
-            if let outputSchema = definition.outputSchema { output = try JSONSchema(.object(outputSchema)) }
+            input = try JSONSchema(.object(definition.inputSchema), registeredSchemas: configuration.schemaResources)
+            if let outputSchema = definition.outputSchema {
+                output = try JSONSchema(.object(outputSchema), registeredSchemas: configuration.schemaResources)
+            }
         } catch {
             throw RegistrationError(reason: "tool \"\(definition.name)\": \(error)")
         }
