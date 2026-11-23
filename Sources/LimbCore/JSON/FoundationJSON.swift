@@ -7,8 +7,8 @@ import Foundation
 enum FoundationJSON {
     /// Parses with `JSONSerialization` and converts the result to `JSONValue`.
     ///
-    /// Everything that could make Foundation crash or silently change the data is refused before
-    /// Foundation sees the input (`precheck`). `maxNodes` is applied while converting, that is
+    /// The input scan checks nesting and protects number text before Foundation sees it.
+    /// `maxNodes` is applied while converting, that is
     /// after Foundation has already built its own tree: it bounds what Limb keeps, not what
     /// Foundation allocates. `rejectDuplicateKeys` cannot be honoured — Foundation keeps one of
     /// the duplicates silently.
@@ -16,11 +16,11 @@ enum FoundationJSON {
         let stack = StackGuard.remaining
         let ceiling = stack == nil ? blindDepthCeiling : depthCeiling
         let limit = min(options.maxDepth, ceiling)
-        let deepest = try precheck(bytes, maxDepth: limit)
+        let (prepared, deepest) = try prepare(bytes, maxDepth: limit)
         if let stack, deepest * stackPerLevel + stackReserve > stack {
             throw JSONParseError(kind: .depthLimitExceeded(limit), offset: 0)
         }
-        let data = bytes.withUnsafeBufferPointer { unsafe Data(buffer: $0) }
+        let data = Data(prepared)
         let object: Any
         do {
             object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
@@ -43,11 +43,10 @@ enum FoundationJSON {
     static let stackPerLevel = 2048
     static let stackReserve = 32 * 1024
 
-    /// Refuses input Foundation must not see and returns the deepest nesting found.
+    /// Refuses input Foundation must not see and wraps each number in a tagged string so
+    /// Foundation cannot round it. Original strings get a different tag, including keys.
     ///
-    /// This is a scan for brackets outside strings, not a parser. It follows the same rule for
-    /// where a string ends as any JSON lexer, so on the prefix Foundation reads before its first
-    /// error the two agree on depth.
+    /// The scan follows JSON string boundaries and leaves structural parsing to Foundation.
     ///
     /// Refused:
     /// - zero bytes: Foundation sniffs UTF-16 and UTF-32, and a UTF-8 JSON text never has one;
@@ -56,7 +55,7 @@ enum FoundationJSON {
     ///   `"\uFEFFa"` would come back as `"a"` and two different keys would become one. The
     ///   text is valid JSON; it is refused because this codec cannot return it unchanged;
     /// - nesting beyond `maxDepth`.
-    private static func precheck(_ bytes: Span<UInt8>, maxDepth: Int) throws(JSONParseError) -> Int {
+    private static func prepare(_ bytes: Span<UInt8>, maxDepth: Int) throws(JSONParseError) -> ([UInt8], Int) {
         var depth = 0
         var deepest = 0
         var inString = false
@@ -65,12 +64,16 @@ enum FoundationJSON {
         if startsWithByteOrderMark(bytes, at: 0) {
             throw JSONParseError(kind: .unexpectedByte(0xEF), offset: 0)
         }
+        var output: [UInt8] = []
+        output.reserveCapacity(count)
         while index < count {
             let byte = bytes[index]
             if byte == 0 { throw JSONParseError(kind: .unexpectedByte(0), offset: index) }
             if inString {
+                output.append(byte)
                 if byte == 0x5C {
                     index += 1
+                    if index < count { output.append(bytes[index]) }
                 } else if byte == 0x22 {
                     inString = false
                 }
@@ -79,18 +82,37 @@ enum FoundationJSON {
                 if startsWithByteOrderMark(bytes, at: index + 1) {
                     throw JSONParseError(kind: .malformed, offset: index)
                 }
-            } else if byte == 0x5B || byte == 0x7B {
-                depth += 1
-                if depth > maxDepth {
-                    throw JSONParseError(kind: .depthLimitExceeded(maxDepth), offset: index)
+                output.append(0x22)
+                output.append(0x73) // Original string.
+            } else if byte == 0x2D || (0x30...0x39).contains(byte) {
+                let start = index
+                do {
+                    _ = try parseNumber(bytes, &index)
+                } catch {
+                    throw JSONParseError(kind: .malformed, offset: 0)
                 }
-                if depth > deepest { deepest = depth }
-            } else if byte == 0x5D || byte == 0x7D {
-                if depth > 0 { depth -= 1 }
+                output.append(0x22)
+                output.append(0x6E) // Exact number text.
+                bytes.extracting(start..<index).withUnsafeBufferPointer { pointer in
+                    unsafe output.append(contentsOf: pointer)
+                }
+                output.append(0x22)
+                continue
+            } else {
+                output.append(byte)
+                if byte == 0x5B || byte == 0x7B {
+                    depth += 1
+                    if depth > maxDepth {
+                        throw JSONParseError(kind: .depthLimitExceeded(maxDepth), offset: index)
+                    }
+                    if depth > deepest { deepest = depth }
+                } else if (byte == 0x5D || byte == 0x7D), depth > 0 {
+                    depth -= 1
+                }
             }
             index += 1
         }
-        return deepest
+        return (output, deepest)
     }
 
     /// Whether U+FEFF starts at `index`, as the bytes `EF BB BF` or as the escape `\uFEFF`.
@@ -147,9 +169,17 @@ enum FoundationJSON {
                 }
                 var value: JSONValue
                 if let string = pending as? String {
-                    value = .string(string)
-                } else if let number = pending as? NSNumber {
-                    value = try convert(number)
+                    let text = String(decoding: string.utf8.dropFirst(), as: UTF8.self)
+                    switch string.utf8.first {
+                    case 0x73:
+                        value = .string(text)
+                    case 0x6E:
+                        value = .number(JSONNumber(validatedLexeme: text))
+                    default:
+                        throw JSONParseError(kind: .malformed, offset: 0)
+                    }
+                } else if let number = pending as? NSNumber, type(of: number) == booleanClass {
+                    value = .bool(number.boolValue)
                 } else if pending is NSNull {
                     value = .null
                 } else if let array = pending as? NSArray {
@@ -209,10 +239,10 @@ enum FoundationJSON {
         }
 
         private func member(of dictionary: NSDictionary, named key: Any) throws(JSONParseError) -> (String, Any) {
-            guard let name = key as? String, let value = dictionary.object(forKey: key) else {
+            guard let name = key as? String, name.utf8.first == 0x73, let value = dictionary.object(forKey: key) else {
                 throw JSONParseError(kind: .malformed, offset: 0)
             }
-            return (name, value)
+            return (String(decoding: name.utf8.dropFirst(), as: UTF8.self), value)
         }
 
         private func descend(_ depth: Int) throws(JSONParseError) {
@@ -221,35 +251,6 @@ enum FoundationJSON {
             }
         }
 
-        /// Integers that fit `Int64` or `UInt64` are exact; every other number is a `Double`.
-        ///
-        /// Foundation returns an `NSDecimalNumber` for numbers a `Double` cannot hold exactly, and
-        /// its text looks exact — but it keeps 38 digits and drops the rest without a trace, so
-        /// a 39-digit integer comes back as a different integer. Nothing in the result tells a
-        /// truncated value from a whole one, so the text is never trusted: such a number becomes
-        /// a `Double`, which is at least visibly approximate when written back.
-        private func convert(_ number: NSNumber) throws(JSONParseError) -> JSONValue {
-            if type(of: number) == booleanClass { return .bool(number.boolValue) }
-            if !(number is NSDecimalNumber) {
-                switch unsafe number.objCType.pointee {
-                case 0x64, 0x66:  // 'd', 'f'
-                    break
-                case 0x51:  // 'Q': above Int64.max the text is the only exact form
-                    let value = number.uint64Value
-                    if let small = Int64(exactly: value) { return .number(JSONNumber(small)) }
-                    if let exact = JSONNumber(lexeme: String(value)) { return .number(exact) }
-                default:
-                    return .number(JSONNumber(number.int64Value))
-                }
-            }
-            // `NSDecimalNumber.doubleValue` is not correctly rounded (`1e30` written out in full
-            // comes back as 9.999999999999999e+29), so the decimal's text is read by Swift instead.
-            let double = number is NSDecimalNumber ? Double(number.stringValue) ?? number.doubleValue : number.doubleValue
-            guard let value = JSONNumber(double) else {
-                throw JSONParseError(kind: .invalidNumber, offset: 0)
-            }
-            return .number(value)
-        }
     }
 }
 #endif

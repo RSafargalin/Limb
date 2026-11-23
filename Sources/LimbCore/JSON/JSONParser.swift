@@ -82,8 +82,7 @@ public enum JSON {
         /// Limb's own strict parser and encoder. The default.
         case limb
         /// `JSONSerialization`, selected by the package trait `FoundationJSON`. A fallback:
-        /// it is slower and does not keep number text, reject duplicate keys or refuse
-        /// trailing commas.
+        /// it is slower and accepts duplicate keys and trailing commas.
         case foundation
     }
 
@@ -127,6 +126,10 @@ public enum JSON {
         #else
         try parseValidated(text.utf8Span.span, options: options)
         #endif
+    }
+
+    static func parseStrict(_ text: String) throws(JSONParseError) -> JSONValue {
+        try parseValidated(text.utf8Span.span, options: .default)
     }
 
     static func parseValidated(
@@ -332,7 +335,7 @@ private func expectLiteral(
     index &+= 4
 }
 
-private func parseNumber(_ bytes: Span<UInt8>, _ index: inout Int) throws(JSONParseError) -> JSONNumber {
+func parseNumber(_ bytes: Span<UInt8>, _ index: inout Int) throws(JSONParseError) -> JSONNumber {
     let start = index
     let count = bytes.count
     var cursor = index

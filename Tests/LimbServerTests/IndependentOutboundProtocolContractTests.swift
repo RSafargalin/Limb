@@ -111,6 +111,38 @@ import Testing
         }
     }
 
+    @Test(arguments: IndependentProtocolRevision.allCases, [false, true])
+    func progressUsesTheExactNumericToken(_ revision: IndependentProtocolRevision, isInteger: Bool) async throws {
+        let server = Server(name: "outbound", version: "1")
+        try server.register(tool: ToolDefinition(name: "report")) { _, context in
+            context.progress(1.5)
+            return .text("finished")
+        }
+        let peer = IndependentProtocolRawPeer(server)
+        if !revision.isModern {
+            let initialize = #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"\#(revision.rawValue)","clientInfo":{"name":"progress","version":"1"},"capabilities":{}}}"#
+            let reply = try #require(peer.send(initialize).first)
+            let negotiated = try JSON.parse(Array(reply.utf8))
+            try #require(negotiated["result"]?["protocolVersion"] == .string(revision.rawValue))
+            _ = peer.send(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        }
+        let token = isInteger ? "18446744073709551617" : "1.0000000000000000001"
+        let metaPrefix = revision.isModern ? String(IndependentProtocol.modernMetaText.dropLast()) + "," : #""_meta":{"#
+        let call = #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"report",\#(metaPrefix)"progressToken":\#(token)}}}"#
+        let frames = await peer.send(call, untilResponseTo: "2")
+        try #require(frames.count == (isInteger ? 2 : 1), "\(frames)")
+        if isInteger {
+            let notice = try JSON.parse(Array(frames[0].utf8))
+            #expect(notice["method"] == "notifications/progress")
+            #expect(frames[0].contains(#""progressToken":\#(token)"#))
+            #expect(notice["params"]?["progressToken"]?.encoded() == Array(token.utf8))
+            #expect(notice["params"]?["progress"] == 1.5)
+        }
+        let reply = try JSON.parse(Array(frames[frames.count - 1].utf8))
+        #expect(reply["id"] == 2)
+        #expect(reply["result"]?["content"]?[0]?["text"] == "finished", "\(reply)")
+    }
+
     private func expectError(
         _ response: JSONValue, id: RequestID, code: Int, sourceLocation: SourceLocation = #_sourceLocation
     ) {

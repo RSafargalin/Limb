@@ -24,9 +24,9 @@ import Testing
             ("byte order mark", "\u{FEFF}" + ping),
             ("UTF-16", String(decoding: ping.utf16.flatMap { [UInt8($0 & 0xFF), UInt8($0 >> 8)] }, as: UTF8.self)),
             ("a zero byte after the message", ping + "\u{0}"),
-            ("a number out of range", #"{"jsonrpc":"2.0","id":1e400,"method":"ping"}"#),
+            ("an integer with a leading zero", #"{"jsonrpc":"2.0","id":01,"method":"ping"}"#),
+            ("a number with an incomplete exponent", #"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"n":1e+}}"#),
             // Valid JSON the fallback cannot read: documented differences, not attacks.
-            ("a number Foundation refuses", #"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"n":1.2345678901234567890123e200}}"#),
             ("a string that starts with U+FEFF", #"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"s":"\ufeffx"}}"#),
             ("a key that starts with U+FEFF", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"\u{FEFF}k\":1}}"),
         ]
@@ -38,6 +38,19 @@ import Testing
             // Still alive, and still in step: the next request gets its own answer.
             #expect(try await client.request("tools/call", ["name": "echo", "arguments": ["text": .string(name)]]).firstText == name)
         }
+    }
+
+    @Test func numbersSurviveTheRoundTrip() async throws {
+        let server = try makeServer()
+        try server.register(method: "example/numbers") { params, _ in
+            ["numbers": params["numbers"] ?? .null]
+        }
+        let client = TestClient(server)
+        client.send(#"{"jsonrpc":"2.0","id":1,"method":"example/numbers","params":{\#(IndependentProtocol.modernMetaText),"numbers":[1e400,1.2345678901234567890123e200]}}"#)
+        let response = try await client.next()
+        #expect(response["id"] == 1)
+        #expect(response["error"] == nil)
+        #expect(response["result"]?["numbers"]?.description == "[1e400,1.2345678901234567890123e200]")
     }
 
     /// What Foundation forgives is served, not refused: the documented price of the fallback.
