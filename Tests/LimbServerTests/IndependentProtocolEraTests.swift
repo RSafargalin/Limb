@@ -382,7 +382,30 @@ private let allVersions = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26
         }
     }
 
-    /// Capabilities advertised match what is registered, in both eras, and follow the registry.
+    @Test(arguments: IndependentProtocolRevision.legacy)
+    func legacyOnlyDiscoveryAllowsInitializationOnTheSameConnection(_ revision: IndependentProtocolRevision) async throws {
+        let client = TestClient(try IndependentProtocolRich.server { $0.supportedVersions = [revision.version] }, modern: false)
+        let id = RequestID("discover-probe")
+        client.send(["jsonrpc": "2.0", "id": id.json, "method": "server/discover", "params": ["_meta": .object(IndependentProtocol.modernMeta)]])
+        let response = try await client.next()
+        #expect(response["id"] == id.json)
+        #expect(response["result"] == nil)
+        #expect(response.code == -32601)
+        #expect(try await client.initialize(version: revision.version)["result"]?["protocolVersion"] == .string(revision.rawValue))
+        #expect(try await client.request("ping")["result"] == [:])
+    }
+
+    @Test(arguments: [false, true])
+    func discoveryWithAnUnsupportedVersionReportsModernError(_ mixed: Bool) async throws {
+        let configured: [ProtocolVersion] = mixed ? [.v2026_07_28, .v2025_11_25] : [.v2026_07_28]
+        let client = TestClient(try IndependentProtocolRich.server { $0.supportedVersions = configured })
+        let reply = try await client.request("server/discover", meta: [MetaKey.protocolVersion: "1900-01-01"])
+        #expect(reply.code == -32022)
+        #expect(reply["error"]?["data"]?["requested"] == "1900-01-01")
+        #expect(reply["error"]?["data"]?["supported"] == .array(configured.map { .string($0.rawValue) }))
+    }
+
+    /// Modern discovery retains list families. A new legacy session advertises currently registered families.
     @Test func capabilitiesReflectTheRegistry() async throws {
         let server = Server(name: "growing", version: "1")
         func capabilities() async throws -> (modern: JSONValue, legacy: JSONValue) {
@@ -409,7 +432,11 @@ private let allVersions = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26
         #expect(seen.modern == seen.legacy)
         server.removeTool(named: "t")
         seen = try await capabilities()
-        #expect(seen.modern["tools"] == nil && seen.legacy["tools"] == nil)
+        #expect(seen.modern["tools"] != nil && seen.legacy["tools"] == nil)
+        server.removePrompt(named: "p")
+        seen = try await capabilities()
+        #expect(seen.modern["prompts"] != nil && seen.legacy["prompts"] == nil)
+        #expect(seen.modern["completions"] == nil && seen.legacy["completions"] == nil)
     }
 
     @Test(arguments: IndependentProtocolRevision.allCases)

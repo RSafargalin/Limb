@@ -7,6 +7,8 @@ import Synchronization
 /// The engine is stateless at its core, as `2026-07-28` requires: a request carries its own
 /// version and capabilities. The `initialize` handshake of earlier revisions is an adapter kept
 /// per connection. One process can serve both kinds of client at once.
+/// Modern discovery keeps a list capability after its first successful registration, even if
+/// the list becomes empty. A legacy connection uses the capabilities advertised at initialize.
 ///
 /// ```swift
 /// let server = Server(name: "weather", version: "1.0.0")
@@ -61,6 +63,7 @@ public final class Server: Sendable {
             var contents = current.contents
             do throws(RegistrationError) {
                 try body(&contents)
+                contents.modernListCapabilities.insert(change.capability)
                 defer { current = RegistrySnapshot(contents) }
                 return current
             } catch {
@@ -506,6 +509,18 @@ public final class Server: Sendable {
 
 enum ListKind: Int, Sendable, CaseIterable {
     case tools, resources, templates, prompts
+
+    var capability: ServerCapability {
+        switch self {
+        case .tools: .tools
+        case .resources, .templates: .resources
+        case .prompts: .prompts
+        }
+    }
+}
+
+enum ServerCapability: Sendable, Hashable {
+    case tools, resources, prompts, completions
 }
 
 enum ServerEvent: Sendable, Hashable {
@@ -567,6 +582,8 @@ struct PromptEntry: Sendable {
 }
 
 struct RegistryContents: Sendable {
+    /// A modern client can refresh a list after its last entry was removed.
+    var modernListCapabilities: Set<ServerCapability> = []
     var tools: [ToolEntry] = []
     var toolIndex: [ExactString: Int] = [:]
     var resources: [ResourceEntry] = []
@@ -588,11 +605,22 @@ struct RegistryContents: Sendable {
 /// once per revision and reused until the registry changes.
 final class RegistrySnapshot: Sendable {
     let contents: RegistryContents
+    let legacyCapabilities: Set<ServerCapability>
+    let modernCapabilities: Set<ServerCapability>
     /// Encoded list results, indexed by `ListKind` then by revision profile.
     private let encodedLists = Mutex<[[UInt8]?]>(Array(repeating: nil, count: ListKind.allCases.count * 4))
 
     init(_ contents: RegistryContents = RegistryContents()) {
         self.contents = contents
+        var capabilities: Set<ServerCapability> = []
+        if !contents.tools.isEmpty { capabilities.insert(.tools) }
+        if !contents.resources.isEmpty || !contents.templates.isEmpty { capabilities.insert(.resources) }
+        if !contents.prompts.isEmpty { capabilities.insert(.prompts) }
+        if contents.prompts.contains(where: { $0.complete != nil }) || contents.templates.contains(where: { $0.complete != nil }) {
+            capabilities.insert(.completions)
+        }
+        legacyCapabilities = capabilities
+        modernCapabilities = capabilities.union(contents.modernListCapabilities)
     }
 
     func tool(named name: String) -> ToolEntry? { contents.toolIndex[ExactString(name)].map { contents.tools[$0] } }

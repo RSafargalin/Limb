@@ -318,6 +318,7 @@ struct IndependentConcurrencySubscriptionTests {
     @Test func nothingIsPushedToAClientThatDidNotAsk() async throws {
         let server = independentConcurrencyServer()
         try server.register(resource: ResourceDefinition(uri: "ic://r", name: "r")) { _, _ in [] }
+        try server.register(tool: ToolDefinition(name: "first")) { _, _ in .text("") }
         // A modern client without a subscription.
         let modern = ICWire(server)
         _ = try await modern.request("tools/list")

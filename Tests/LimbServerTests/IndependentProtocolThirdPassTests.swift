@@ -60,11 +60,9 @@ private let kelvin = "\u{212A}"
         ("completions", "completion/complete", ["ref": ["type": "ref/prompt", "name": "nobody"], "argument": ["name": "a", "value": ""]], false),
     ]
 
-    /// For a handshake session a method exists when its capability was announced by that
-    /// session's `initialize` or is announced now; for `2026-07-28` only when it is announced now.
-    /// Checked after every step of scripts that register and remove things, for sessions opened
-    /// at the start and in the middle, on every revision. The oracle for "announced now" is a
-    /// fresh `server/discover`; for "announced then", the session's own `initialize` result.
+    /// Legacy requests use the capabilities announced by that session's initialize.
+    /// Modern requests use current discovery, which retains list families across removals.
+    /// Check each step for sessions opened before and during the registry changes.
     @Test(arguments: [
         "+tool -tool +tool -tool",
         "+tool +resource +prompt +completing | -tool -resource -prompt -completing",
@@ -73,36 +71,43 @@ private let kelvin = "\u{212A}"
         "+prompt +completing -prompt | -completing +tool -tool",
         "+resource | -resource +resource -resource | +tool",
     ])
-    func theGateIsNegotiatedOrOffered(_ script: String) async throws {
+    func routingUsesTheCapabilitiesOfItsOwnEra(_ script: String) async throws {
         let server = Server(name: "gate", version: "1")
         var registered: Set<Item> = []
+        var registeredListFamilies: Set<String> = []
+        func currentFamilies() -> Set<String> {
+            registered.reduce(into: Set<String>()) { $0.formUnion($1.capabilities) }
+        }
         /// Sessions, each with the capabilities its handshake announced (`nil` for the modern client).
         var sessions: [(label: String, client: TestClient, revision: IndependentProtocolRevision, negotiated: Set<String>?)] = []
         func open(_ label: String) async throws {
             for revision in IndependentProtocolRevision.legacy {
                 let client = TestClient(server, modern: false)
                 let capabilities = try #require(try await client.initialize(version: revision.version)["result"]?["capabilities"]?.objectValue)
-                sessions.append(("\(label) \(revision.rawValue)", client, revision, Set(capabilities.map(\.key))))
+                let negotiated = Set(capabilities.map(\.key))
+                #expect(negotiated.subtracting(["logging"]) == currentFamilies(), "\(label) \(revision.rawValue)")
+                sessions.append(("\(label) \(revision.rawValue)", client, revision, negotiated))
             }
             sessions.append(("\(label) modern", TestClient(server), .r2026_07_28, nil))
         }
         func check(_ step: String) async throws {
             let now = try #require(try await TestClient(server).request("server/discover")["result"]?["capabilities"]?.objectValue)
             let offered = Set(now.map(\.key))
-            // What is announced follows from what is registered.
-            #expect(offered.subtracting(["logging"]) == registered.reduce(into: Set<String>()) { $0.formUnion($1.capabilities) }, "after \(step)")
+            let expected = registeredListFamilies.union(currentFamilies().intersection(["completions"]))
+            #expect(offered.subtracting(["logging"]) == expected, "after \(step)")
             for (label, client, revision, negotiated) in sessions {
                 for (capability, method, params, legacyOnly) in Self.gated {
                     let response = try await client.request(method, params)
-                    let exists = (offered.contains(capability) || negotiated?.contains(capability) == true) && !(legacyOnly && revision.isModern)
+                    let exists = (negotiated ?? offered).contains(capability) && !(legacyOnly && revision.isModern)
                     #expect((response.code != -32601) == exists, "after \(step), session \(label) (negotiated \(negotiated?.sorted() ?? [])), offered \(offered.sorted()): \(method) → \(response)")
                     // A served listing shows what is registered now, whenever the session was opened.
-                    if let result = response["result"], exists {
+                    if exists {
+                        let result = response["result"]
                         switch method {
-                        case "tools/list": #expect(result["tools"]?.arrayValue?.count == (registered.contains(.tool) ? 1 : 0), "\(label) after \(step)")
-                        case "resources/list": #expect(result["resources"]?.arrayValue?.count == (registered.contains(.resource) ? 1 : 0), "\(label) after \(step)")
-                        case "resources/templates/list": #expect(result["resourceTemplates"] == [], "\(label) after \(step)")
-                        case "prompts/list": #expect(result["prompts"]?.arrayValue?.count == registered.intersection([.prompt, .completing]).count, "\(label) after \(step)")
+                        case "tools/list": #expect(result?["tools"]?.arrayValue?.count == (registered.contains(.tool) ? 1 : 0), "\(label) after \(step)")
+                        case "resources/list": #expect(result?["resources"]?.arrayValue?.count == (registered.contains(.resource) ? 1 : 0), "\(label) after \(step)")
+                        case "resources/templates/list": #expect(result?["resourceTemplates"] == [], "\(label) after \(step)")
+                        case "prompts/list": #expect(result?["prompts"]?.arrayValue?.count == registered.intersection([.prompt, .completing]).count, "\(label) after \(step)")
                         default: break
                         }
                     }
@@ -122,6 +127,7 @@ private let kelvin = "\u{212A}"
                 if step.hasPrefix("+") {
                     try Self.add(item, to: server)
                     registered.insert(item)
+                    registeredListFamilies.formUnion(item.capabilities.subtracting(["completions"]))
                 } else {
                     Self.remove(item, from: server)
                     registered.remove(item)
@@ -158,11 +164,12 @@ private let kelvin = "\u{212A}"
         for (_, method, params, _) in Self.gated {
             #expect(try await client.request(method, params).code == -32601, "\(method) survived the second handshake")
         }
-        // Registered again: offered now, to this session too; a third handshake negotiates it.
+        // A third handshake negotiates the family registered since the second handshake.
         try Self.add(.tool, to: server)
-        #expect(try await client.request("tools/list")["result"]?["tools"]?.arrayValue?.count == 1)
+        #expect(try await client.request("tools/list").code == -32601)
         let third = try #require(try await client.initialize(version: revision.version)["result"]?["capabilities"])
         #expect(third["tools"] != nil && third["prompts"] == nil)
+        #expect(try await client.request("tools/list")["result"]?["tools"]?[0]?["name"] == "t")
         Self.remove(.tool, from: server)
         #expect(try await client.request("tools/list")["result"]?["tools"] == [])
         #expect(try await client.request("prompts/list").code == -32601)
@@ -177,15 +184,14 @@ private let kelvin = "\u{212A}"
         let client = try await IndependentProtocol.client(server, .r2025_03_26)
         for item in Item.allCases { Self.remove(item, from: server) }
         client.clearReceived()
-        for (_, method, params, legacyOnly) in Self.gated {
+        for (capability, method, params, legacyOnly) in Self.gated {
             let legacy = try await client.request(method, params)
             #expect(legacy.code != -32601, "the session negotiated it: \(method) → \(legacy)")
             let modern = try await client.request(method, params, meta: IndependentProtocol.modernMeta)
-            #expect(modern.code == -32601, "\(method) with 2026-07-28 metadata → \(modern)")
-            _ = legacyOnly
+            #expect((modern.code == -32601) == (legacyOnly || capability == "completions"), "\(method) with 2026-07-28 metadata → \(modern)")
         }
         let discovered = try #require(try await client.request("server/discover", meta: IndependentProtocol.modernMeta)["result"]?["capabilities"]?.objectValue)
-        #expect(Set(discovered.map(\.key)) == ["logging"])
+        #expect(Set(discovered.map(\.key)) == ["logging", "tools", "resources", "prompts"])
     }
 
     // MARK: Ids (fix 2)
