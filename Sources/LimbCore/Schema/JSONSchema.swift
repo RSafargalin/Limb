@@ -19,7 +19,7 @@ public struct SchemaViolation: Error, Sendable, Equatable, CustomStringConvertib
     }
 }
 
-/// A compiled JSON Schema (2020-12, with the draft-07 spellings of the same keywords).
+/// A compiled JSON Schema using the supported keywords of 2020-12 or draft-07.
 ///
 /// Compilation happens once, when a tool is registered; validation walks the compiled form.
 /// Per the MCP specification:
@@ -341,7 +341,7 @@ private struct Compiler {
     var nodes: [Node] = []
     /// Pointer of an already compiled (or in-progress) subschema to its node, so recursive
     /// references terminate.
-    var byPointer: [String: Int] = [:]
+    var byPointer: [ExactString: Int] = [:]
 
     /// Compiles a whole document. Whether it ran out of stack is reported apart from the
     /// result, which is not to be trusted then.
@@ -372,7 +372,8 @@ private struct Compiler {
     static let schemaListKeywords: Set<String> = ["allOf", "anyOf", "oneOf", "prefixItems"]
 
     mutating func compile(_ schema: JSONValue, pointer: String, depth: Int) throws(JSONSchemaError) -> Int {
-        if let existing = byPointer[pointer] { return existing }
+        let key = ExactString(pointer)
+        if let existing = byPointer[key] { return existing }
         guard depth <= limits.maxDepth else {
             throw JSONSchemaError(reason: "schema nesting deeper than \(limits.maxDepth)", pointer: pointer)
         }
@@ -385,7 +386,7 @@ private struct Compiler {
         }
         let index = nodes.count
         nodes.append(Node())
-        byPointer[pointer] = index
+        byPointer[key] = index
 
         switch schema {
         case .bool(let value):
@@ -401,11 +402,12 @@ private struct Compiler {
 
     mutating func compileObject(_ object: JSONObject, pointer: String, depth: Int) throws(JSONSchemaError) -> Node {
         let node = Node()
-        for keyword in Compiler.unsupported where object.contains(keyword) {
+        for keyword in Compiler.unsupported where !isDraft7 && object.contains(keyword) {
             throw JSONSchemaError(reason: "unsupported keyword \"\(keyword)\"", pointer: pointer)
         }
 
         func sub(_ key: String) -> String { "\(pointer)/\(escape(key))" }
+        try validateAnnotations(object, at: pointer)
 
         if !pointer.isEmpty {
             // Both would start a new schema resource, against which references inside resolve
@@ -480,16 +482,18 @@ private struct Compiler {
 
         node.minItems = try count(object, "minItems", pointer)
         node.maxItems = try count(object, "maxItems", pointer)
-        node.minContains = try count(object, "minContains", pointer)
-        node.maxContains = try count(object, "maxContains", pointer)
+        if !isDraft7 {
+            node.minContains = try count(object, "minContains", pointer)
+            node.maxContains = try count(object, "maxContains", pointer)
+            if let prefix = object["prefixItems"] {
+                node.prefixItems = try compileList(prefix, pointer: sub("prefixItems"), depth: depth)
+            }
+        }
         if let unique = object["uniqueItems"] {
             guard let flag = unique.boolValue else {
                 throw JSONSchemaError(reason: "\"uniqueItems\" must be a boolean", pointer: sub("uniqueItems"))
             }
             node.uniqueItems = flag
-        }
-        if let prefix = object["prefixItems"] {
-            node.prefixItems = try compileList(prefix, pointer: sub("prefixItems"), depth: depth)
         }
         // Draft-07 applies `additionalItems` only after array-form `items`, but checks it always;
         // 2020-12 has no such keyword, and a schema that relies on it would go unenforced.
@@ -544,7 +548,7 @@ private struct Compiler {
         }
         node.minProperties = try count(object, "minProperties", pointer)
         node.maxProperties = try count(object, "maxProperties", pointer)
-        if let dependent = object["dependentRequired"] {
+        if !isDraft7, let dependent = object["dependentRequired"] {
             guard case .object(let map) = dependent else {
                 throw JSONSchemaError(reason: "\"dependentRequired\" must be an object", pointer: sub("dependentRequired"))
             }
@@ -552,20 +556,22 @@ private struct Compiler {
                 node.dependentRequired.append((name, try strings(needs, pointer: "\(sub("dependentRequired"))/\(escape(name))")))
             }
         }
-        if let dependent = object["dependentSchemas"] {
+        if !isDraft7, let dependent = object["dependentSchemas"] {
             node.dependentSchemas = try compileMap(dependent, pointer: sub("dependentSchemas"), depth: depth)
         }
         if let dependencies = object["dependencies"] {
-            // draft-07: one keyword for both forms.
+            // Both meta-schemas describe this legacy shape. Only draft-07 applies it.
             guard case .object(let map) = dependencies else {
                 throw JSONSchemaError(reason: "\"dependencies\" must be an object", pointer: sub("dependencies"))
             }
             for (name, value) in map {
                 let location = "\(sub("dependencies"))/\(escape(name))"
                 if case .array = value {
-                    node.dependentRequired.append((name, try strings(value, pointer: location)))
+                    let required = try strings(value, pointer: location)
+                    if isDraft7 { node.dependentRequired.append((name, required)) }
                 } else {
-                    node.dependentSchemas.append((name, try compile(value, pointer: location, depth: depth + 1)))
+                    let dependent = try compile(value, pointer: location, depth: depth + 1)
+                    if isDraft7 { node.dependentSchemas.append((name, dependent)) }
                 }
             }
         }
@@ -645,13 +651,34 @@ private struct Compiler {
             throw JSONSchemaError(reason: "expected an array of strings", pointer: pointer)
         }
         var result: [String] = []
+        var seen: Set<ExactString> = []
         for element in list {
             guard let text = element.stringValue else {
                 throw JSONSchemaError(reason: "expected an array of strings", pointer: pointer)
             }
+            guard seen.insert(ExactString(text)).inserted else {
+                throw JSONSchemaError(reason: "array members must be unique", pointer: pointer)
+            }
             result.append(text)
         }
         return result
+    }
+
+    private func validateAnnotations(_ object: JSONObject, at pointer: String) throws(JSONSchemaError) {
+        for key in ["title", "description", "$comment", "format", "contentEncoding", "contentMediaType"] {
+            if let value = object[key], value.stringValue == nil {
+                throw JSONSchemaError(reason: "\"\(key)\" must be a string", pointer: "\(pointer)/\(key)")
+            }
+        }
+        let booleans = isDraft7 ? ["readOnly", "writeOnly"] : ["readOnly", "writeOnly", "deprecated"]
+        for key in booleans {
+            if let value = object[key], value.boolValue == nil {
+                throw JSONSchemaError(reason: "\"\(key)\" must be a boolean", pointer: "\(pointer)/\(key)")
+            }
+        }
+        if let examples = object["examples"], examples.arrayValue == nil {
+            throw JSONSchemaError(reason: "\"examples\" must be an array", pointer: "\(pointer)/examples")
+        }
     }
 
     /// Resolves a `$ref` inside the schema document. Nothing is ever fetched.
@@ -665,12 +692,14 @@ private struct Compiler {
                 reason: "\"$ref\" to \"\(reference)\" points outside the schema; external references are not dereferenced",
                 pointer: pointer)
         }
-        let target = String(reference.dropFirst())
-        guard target.isEmpty || target.hasPrefix("/") else {
-            throw JSONSchemaError(reason: "\"$ref\" to anchor \"\(reference)\" is not supported", pointer: pointer)
-        }
         func unresolved(_ why: String) -> JSONSchemaError {
             JSONSchemaError(reason: "\"$ref\" to \"\(reference)\" \(why)", pointer: pointer)
+        }
+        guard let target = decodeFragment(reference.utf8.dropFirst()) else {
+            throw unresolved("is not a well-formed JSON pointer fragment")
+        }
+        guard target.isEmpty || target.utf8.first == 0x2F else {
+            throw unresolved("points to an unsupported anchor")
         }
         enum Place { case schema, map, list, dependencies }
         var current = document
@@ -679,19 +708,21 @@ private struct Compiler {
         // that two spellings of one location share a node.
         var canonical = ""
         // A pointer is "/"-separated; an empty token is a legitimate (empty) key.
-        for raw in target.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
-            guard let token = unescape(String(raw)) else { throw unresolved("is not a well-formed JSON pointer fragment") }
+        for raw in target.utf8.split(separator: 0x2F, omittingEmptySubsequences: false).dropFirst() {
+            guard let token = unescape(String(decoding: raw, as: UTF8.self)) else {
+                throw unresolved("is not a well-formed JSON pointer fragment")
+            }
             canonical += "/" + escape(token)
             switch (place, current) {
             case (.schema, .object(let object)):
                 guard let next = object[token] else { throw unresolved("does not resolve") }
                 current = next
-                if Compiler.schemaKeywords.contains(token) {
+                if Compiler.schemaKeywords.contains(token), token != "additionalItems" || isDraft7 {
                     // Draft-07 `items` may be an array of schemas.
-                    if case .array = next, token == "items" { place = .list } else { place = .schema }
-                } else if Compiler.schemaMapKeywords.contains(token) {
+                    if case .array = next, token == "items", isDraft7 { place = .list } else { place = .schema }
+                } else if Compiler.schemaMapKeywords.contains(token), token != "dependentSchemas" || !isDraft7 {
                     place = .map
-                } else if Compiler.schemaListKeywords.contains(token) {
+                } else if Compiler.schemaListKeywords.contains(token), token != "prefixItems" || !isDraft7 {
                     place = .list
                 } else if token == "dependencies" {
                     place = .dependencies
@@ -717,44 +748,51 @@ private struct Compiler {
             }
         }
         guard place == .schema else { throw unresolved("does not point to a schema") }
-        if let existing = byPointer[canonical] { return existing }
         return try compile(current, pointer: canonical, depth: depth + 1)
     }
 
     func escape(_ token: String) -> String {
-        guard token.contains("~") || token.contains("/") else { return token }
-        return token.replacing("~", with: "~0").replacing("/", with: "~1")
+        guard token.utf8.contains(where: { $0 == 0x7E || $0 == 0x2F }) else { return token }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(token.utf8.count)
+        for byte in token.utf8 {
+            switch byte {
+            case 0x7E: bytes.append(contentsOf: [0x7E, 0x30])
+            case 0x2F: bytes.append(contentsOf: [0x7E, 0x31])
+            default: bytes.append(byte)
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
-    /// A pointer in a URI fragment is percent-encoded first and JSON-pointer-escaped second.
-    /// `nil` for a token that is malformed either way: `%` not followed by two hexadecimal
-    /// digits, percent-encoded bytes that are not UTF-8, `~` not followed by `0` or `1`. Read
-    /// leniently, each would resolve to a member with some other name.
-    func unescape(_ token: String) -> String? {
-        var token = token
-        if token.contains("%") {
-            func hex(_ byte: UInt8) -> UInt8? {
-                switch byte {
-                case 0x30...0x39: byte - 0x30
-                case 0x41...0x46: byte - 0x41 + 10
-                case 0x61...0x66: byte - 0x61 + 10
-                default: nil
-                }
+    /// Percent-decode the entire URI fragment before reading the JSON Pointer it represents.
+    private func decodeFragment(_ fragment: String.UTF8View.SubSequence) -> String? {
+        if !fragment.contains(0x25) { return String(decoding: fragment, as: UTF8.self) }
+        func hex(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 0x30...0x39: byte - 0x30
+            case 0x41...0x46: byte - 0x41 + 10
+            case 0x61...0x66: byte - 0x61 + 10
+            default: nil
             }
-            var bytes: [UInt8] = []
-            var iterator = token.utf8.makeIterator()
-            while let byte = iterator.next() {
-                guard byte == 0x25 else {
-                    bytes.append(byte)
-                    continue
-                }
+        }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(fragment.count)
+        var iterator = fragment.makeIterator()
+        while let byte = iterator.next() {
+            if byte == 0x25 {
                 guard let high = iterator.next().flatMap(hex), let low = iterator.next().flatMap(hex) else { return nil }
                 bytes.append(high << 4 | low)
+            } else {
+                bytes.append(byte)
             }
-            guard let decoded = String(validating: bytes, as: UTF8.self) else { return nil }
-            token = decoded
         }
-        guard token.contains("~") else { return token }
+        return String(validating: bytes, as: UTF8.self)
+    }
+
+    /// Within a JSON Pointer token, a tilde must be escaped as `~0` and a slash as `~1`.
+    func unescape(_ token: String) -> String? {
+        guard token.utf8.contains(0x7E) else { return token }
         var result = ""
         var scalars = token.unicodeScalars.makeIterator()
         while let scalar = scalars.next() {
