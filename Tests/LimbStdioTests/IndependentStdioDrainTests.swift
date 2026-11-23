@@ -131,6 +131,7 @@ extension IndependentStdioTransportTests {
     @Suite struct Drain {
         // MARK: The deadline
 
+        #if canImport(Darwin)
         @Test(arguments: [0.5, 2.0])
         func aClientThatNeverReadsCostsExactlyTheDeadline(seconds: Double) throws {
             let abandoned: Abandoned
@@ -143,6 +144,8 @@ extension IndependentStdioTransportTests {
             #expect(abandoned.fixture.log.all.count == 1, "\(abandoned.fixture.log.all)")
             #expect(abandoned.writer.count == 1, "the writer left behind: \(abandoned.writer.count) threads")
         }
+
+        #endif
 
         /// The deadline is a limit, not a wait: with nothing left to write `run` returns at once.
         @Test func nothingToWriteMeansNothingToWaitFor() throws {
@@ -832,7 +835,9 @@ extension IndependentStdioTransportTests {
             #expect(client.stopped(within: 10))
             #expect(Date().timeIntervalSince(left) < 5, "the grace period of 30 s is not for a peer that is gone")
             #expect(fixture.probe.cancelledTags == ["bystander"])
+            #if canImport(Darwin)
             #expect(threadsGone(threads, within: 5))
+            #endif
         }
 
         @Test func aSocketPeerThatLeavesIsNotLoggedAsAWriteFailure() throws {
