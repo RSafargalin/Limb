@@ -342,4 +342,5 @@ struct Peer: Sendable {
     let clientInfo: Implementation?
     /// Minimum level for `notifications/message` on this request; `nil` sends none.
     let logLevel: LoggingLevel?
+    var negotiatedServerCapabilities: Set<ServerCapability> = []
 }

@@ -270,23 +270,60 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
         }
     }
 
-    /// `2026-07-28` is stateless: what a request gets follows the registry at that moment, and
-    /// agrees with what `server/discover` says at that moment.
-    @Test func theModernGateFollowsTheRegistry() async throws {
+    @Test func modernListsRemainAvailableAfterTheLastEntryIsRemoved() async throws {
         let server = Server(name: "gate", version: "1")
         let client = TestClient(server)
-        func announced() async throws -> Bool { try await client.request("server/discover")["result"]?["capabilities"]?["tools"] != nil }
-        #expect(try await !announced())
+        let beforeRegistration = try #require(try await client.request("server/discover")["result"]?["capabilities"])
+        #expect(beforeRegistration["tools"] == nil)
         #expect(try await client.request("tools/list").code == -32601)
         try server.register(tool: ToolDefinition(name: "first")) { _, _ in .text("first") }
-        #expect(try await announced())
-        #expect(try await client.request("tools/list")["result"]?["tools"]?.arrayValue?.count == 1)
+        try server.register(resource: ResourceDefinition(uri: "list://item", name: "item")) { _, _ in [] }
+        try server.register(prompt: PromptDefinition(name: "first")) { _, _ in PromptResult(messages: []) }
+        let afterRegistration = try #require(try await client.request("server/discover")["result"]?["capabilities"])
+        #expect(afterRegistration["tools"]?["listChanged"] == true)
+        #expect(try await client.request("tools/list")["result"]?["tools"]?[0]?["name"] == "first")
+        #expect(try await client.request("resources/list")["result"]?["resources"]?[0]?["uri"] == "list://item")
+        #expect(try await client.request("prompts/list")["result"]?["prompts"]?[0]?["name"] == "first")
         #expect(try await client.request("tools/call", ["name": "first"]).text == "first")
         #expect(try await client.request("tools/call", ["name": "nobody"]).code == -32602)
+
+        let changes: JSONObject = ["toolsListChanged": true, "resourcesListChanged": true, "promptsListChanged": true]
+        let subscription = client.post("subscriptions/listen", ["notifications": .object(changes)], id: RequestID("list-refresh"))
+        let acknowledged = try await client.next()
+        #expect(acknowledged["method"] == "notifications/subscriptions/acknowledged")
+        #expect(acknowledged["params"]?["_meta"]?[MetaKey.subscriptionID] == subscription.json)
+        for key in changes.map(\.key) {
+            #expect(acknowledged["params"]?["notifications"]?[key] == true)
+        }
+
+        func checkRefresh(_ family: String) async throws {
+            let events = try await IndependentProtocol.drain(client)
+            #expect(events.map { $0["method"]?.stringValue } == ["notifications/\(family)/list_changed"])
+            #expect(events.first?["params"]?["_meta"]?[MetaKey.subscriptionID] == subscription.json)
+            let advertised = try #require(try await TestClient(server).request("server/discover")["result"]?["capabilities"])
+            #expect(advertised[family]?["listChanged"] == true, "\(family)")
+            #expect(try await client.request("\(family)/list")["result"]?[family] == [], "\(family)")
+        }
+
         server.removeTool(named: "first")
-        #expect(try await !announced())
-        #expect(try await client.request("tools/list").code == -32601)
-        #expect(try await client.request("tools/call", ["name": "first"]).code == -32601)
+        try await checkRefresh("tools")
+        server.removeResource(uri: "list://item")
+        try await checkRefresh("resources")
+        server.removePrompt(named: "first")
+        try await checkRefresh("prompts")
+        #expect(try await client.request("tools/call", ["name": "first"]).code == -32602)
+    }
+
+    @Test func modernTemplateOnlyRegistrationOffersBothResourceLists() async throws {
+        let server = Server(name: "templates", version: "1")
+        let client = TestClient(server)
+        #expect(try await client.request("resources/templates/list").code == -32601)
+        try server.register(resourceTemplate: ResourceTemplateDefinition(uriTemplate: "list://items/{id}", name: "item")) { _, _ in [] }
+        let capabilities = try #require(try await client.request("server/discover")["result"]?["capabilities"])
+        #expect(capabilities["resources"]?["listChanged"] == true)
+        #expect(try await client.request("resources/list")["result"]?["resources"] == [])
+        let templates = try #require(try await client.request("resources/templates/list")["result"]?["resourceTemplates"]?.arrayValue)
+        #expect(templates.map { $0["uriTemplate"] } == ["list://items/{id}"])
     }
 
     /// A handshake session negotiated its capabilities once: "Both parties MUST … only use
@@ -302,6 +339,9 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
         let capabilities = try #require(try await client.initialize(version: revision.version)["result"]?["capabilities"])
         #expect(capabilities["tools"]?["listChanged"] == true && capabilities["prompts"]?["listChanged"] == true && capabilities["resources"]?["listChanged"] == true)
         _ = try await IndependentProtocol.drain(client)
+        #expect(try await client.request("tools/list")["result"]?["tools"]?[0]?["name"] == "t")
+        #expect(try await client.request("prompts/list")["result"]?["prompts"]?[0]?["name"] == "plain")
+        #expect(try await client.request("resources/list")["result"]?["resources"]?[0]?["uri"] == "g://fixed")
 
         server.removeTool(named: "t")
         #expect(try await IndependentProtocol.drain(client).map { $0["method"] } == ["notifications/tools/list_changed"])
@@ -328,11 +368,8 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
         #expect(try await client.request("tools/list")["result"]?["tools"]?.arrayValue?.count == 1)
     }
 
-    /// The other direction: a session opened while the server had no tools. If the server tells
-    /// such a session that the tool list changed, the list it points to has to be there.
-    /// (Whether it should tell a session that never negotiated `tools` at all is not pinned here.)
     @Test(arguments: IndependentProtocolRevision.legacy)
-    func whatListChangedAnnouncesCanBeListed(_ revision: IndependentProtocolRevision) async throws {
+    func familyRegisteredAfterInitializeRequiresAnotherHandshake(_ revision: IndependentProtocolRevision) async throws {
         let server = Server(name: "late", version: "1")
         let client = TestClient(server, modern: false)
         let capabilities = try #require(try await client.initialize(version: revision.version)["result"]?["capabilities"])
@@ -342,21 +379,25 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
         try server.register(tool: ToolDefinition(name: "late")) { _, _ in .text("late") }
         try server.register(prompt: PromptDefinition(name: "late")) { _, _ in PromptResult(messages: []) }
         try server.register(resource: ResourceDefinition(uri: "late://r", name: "late")) { request, _ in [.text(uri: request.uri, text: "late")] }
-        let announced = Set(try await IndependentProtocol.drain(client).compactMap { $0["method"]?.stringValue })
-        if announced.contains("notifications/tools/list_changed") {
-            #expect(try await client.request("tools/list")["result"]?["tools"]?[0]?["name"] == "late")
-            #expect(try await client.request("tools/call", ["name": "late"]).text == "late")
+        #expect(try await IndependentProtocol.drain(client).isEmpty)
+        for (capability, method, params, _) in Self.gated where ["tools", "prompts", "resources"].contains(capability) {
+            #expect(try await client.request(method, params).code == -32601, "\(method)")
         }
-        if announced.contains("notifications/prompts/list_changed") {
-            #expect(try await client.request("prompts/list")["result"]?["prompts"]?[0]?["name"] == "late")
-        }
-        if announced.contains("notifications/resources/list_changed") {
-            #expect(try await client.request("resources/list")["result"]?["resources"]?[0]?["uri"] == "late://r")
-            #expect(try await client.request("resources/read", ["uri": "late://r"]).readText == "late")
-        }
-        // A new session on the same connection sees the capabilities as they now are.
+        #expect(try await client.request("tools/call", ["name": "late"]).code == -32601)
+        #expect(try await client.request("prompts/get", ["name": "late"]).code == -32601)
+        #expect(try await client.request("resources/read", ["uri": "late://r"]).code == -32601)
+        #expect(try await client.request("ping")["result"] == [:])
+
+        let fresh = try await IndependentProtocol.client(server, revision)
+        #expect(try await fresh.request("tools/list")["result"]?["tools"]?[0]?["name"] == "late")
+        #expect(try await fresh.request("prompts/list")["result"]?["prompts"]?[0]?["name"] == "late")
+        #expect(try await fresh.request("resources/list")["result"]?["resources"]?[0]?["uri"] == "late://r")
+
         let renewed = try #require(try await client.initialize(version: revision.version)["result"]?["capabilities"])
         #expect(renewed["tools"] != nil && renewed["prompts"] != nil && renewed["resources"] != nil)
+        #expect(try await client.request("tools/call", ["name": "late"]).text == "late")
+        #expect(try await client.request("prompts/get", ["name": "late"])["result"]?["messages"] == [])
+        #expect(try await client.request("resources/read", ["uri": "late://r"]).readText == "late")
     }
 
     // MARK: Cursors (fix 11)
@@ -461,8 +502,9 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
                         #expect(items.allSatisfy { names.contains($0["name"]?.stringValue ?? "") }, "a tool that is not registered: \(result)")
                         cursor = result["nextCursor"]
                     } else {
-                        // Refused: the registry no longer has that position — or has no tools at all.
-                        #expect(response.code == (names.isEmpty ? -32601 : -32602), "page size \(pageSize) script \(script): \(response)")
+                        // The registry no longer has the position named by the cursor.
+                        #expect(cursor != nil, "a fresh list failed: \(response)")
+                        #expect(response.code == -32602, "page size \(pageSize) script \(script): \(response)")
                         cursor = nil
                     }
                     if let change = changes.popFirst() {
@@ -479,17 +521,20 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
                     steps += 1
                     try #require(steps < 40, "paging does not end: page size \(pageSize) script \(script)")
                 } while cursor != nil
-                // A fresh walk afterwards sees exactly what is registered.
+                // A fresh walk afterwards sees exactly what is registered, including an empty list.
                 var seen: [String] = []
                 cursor = nil
+                steps = 0
                 repeat {
                     let response = try await client.request("tools/list", cursor.map { ["cursor": $0] } ?? [:])
-                    guard let result = response["result"] else {
-                        #expect(names.isEmpty && response.code == -32601, "\(response)")
-                        break
-                    }
-                    seen += result["tools"]?.arrayValue?.compactMap { $0["name"]?.stringValue } ?? []
+                    let result = try #require(response["result"], "\(response)")
+                    let items = try #require(result["tools"]?.arrayValue)
+                    #expect(items.count <= pageSize)
+                    #expect(items.isEmpty == names.isEmpty)
+                    seen += items.compactMap { $0["name"]?.stringValue }
                     cursor = result["nextCursor"]
+                    steps += 1
+                    try #require(steps < 40, "fresh paging does not end: page size \(pageSize) script \(script)")
                 } while cursor != nil
                 #expect(seen == names, "page size \(pageSize) script \(script)")
             }

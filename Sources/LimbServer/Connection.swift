@@ -53,12 +53,7 @@ public final class Connection: Sendable {
         var resourceSubscriptions: Set<ExactString> = []
         /// The capabilities the `initialize` result announced. They hold for the whole session:
         /// a client that negotiated tools may ask for the list after the last tool is gone.
-        var negotiated: Set<Capability> = []
-    }
-
-    /// A group of methods the server offers only when it has something of that kind.
-    private enum Capability: Sendable {
-        case tools, resources, prompts, completions
+        let negotiated: Set<ServerCapability>
     }
 
     private enum Responder {
@@ -265,6 +260,12 @@ public final class Connection: Sendable {
     /// Decides how to serve a request from how it presents itself: per-request metadata means
     /// modern; otherwise the connection's `initialize` session, if there is one.
     private func resolvePeer(method: String, meta: JSONObject) throws(MCPError) -> Peer {
+        if method == "server/discover", !configuration.legacyVersions.isEmpty,
+            !configuration.supportedVersions.contains(where: { RevisionProfile.profile(for: $0)?.hasDiscover == true })
+        {
+            // A dual-era stdio client falls back to initialize on an unrecognized discovery method.
+            throw .methodNotFound(method)
+        }
         if let versionValue = meta[MetaKey.protocolVersion] {
             guard let requested = versionValue.stringValue else {
                 throw .invalidParams("_meta[\"\(MetaKey.protocolVersion)\"] must be a string")
@@ -292,7 +293,7 @@ public final class Connection: Sendable {
         if let legacy = state.withLock({ $0.legacy }) {
             return Peer(
                 profile: legacy.profile, capabilities: legacy.capabilities, clientInfo: legacy.clientInfo,
-                logLevel: nil)
+                logLevel: nil, negotiatedServerCapabilities: legacy.negotiated)
         }
         if method == "ping", let version = configuration.legacyVersions.max(),
             let profile = RevisionProfile.profile(for: version)
@@ -326,17 +327,16 @@ public final class Connection: Sendable {
         let asked = ProtocolVersion(rawValue: requested)
         let version = offered.contains(asked) ? asked : newest
         let profile = RevisionProfile.profile(for: version)!
-        let registry = server.snapshot
-        var session = LegacySession(
+        let negotiated = server.snapshot.legacyCapabilities
+        let session = LegacySession(
             profile: profile,
             capabilities: ClientCapabilities(raw: params["capabilities"]?.objectValue ?? JSONObject()),
-            clientInfo: Implementation(lenient: params["clientInfo"]))
-        session.negotiated = Self.capabilities(of: registry.contents)
+            clientInfo: Implementation(lenient: params["clientInfo"]), negotiated: negotiated)
         let frame = Frame.result(id: id) { writer in
             writer.beginObject()
             writer.field("protocolVersion", version.rawValue)
             writer.key("capabilities")
-            writeCapabilities(to: &writer, registry: registry)
+            writeCapabilities(to: &writer, capabilities: negotiated)
             writer.field("serverInfo", configuration.info, profile)
             writer.field("instructions", configuration.instructions)
             writer.endObject()
@@ -363,23 +363,22 @@ public final class Connection: Sendable {
         dropUnwantedEventsLocked(&state)
     }
 
-    private func writeCapabilities(to writer: inout JSONWriter, registry: RegistrySnapshot) {
-        let contents = registry.contents
+    private func writeCapabilities(to writer: inout JSONWriter, capabilities: Set<ServerCapability>) {
         writer.beginObject()
-        if !contents.tools.isEmpty {
+        if capabilities.contains(.tools) {
             writer.key("tools")
             writer.beginObject()
             writer.field("listChanged", true)
             writer.endObject()
         }
-        if !contents.resources.isEmpty || !contents.templates.isEmpty {
+        if capabilities.contains(.resources) {
             writer.key("resources")
             writer.beginObject()
             writer.field("subscribe", true)
             writer.field("listChanged", true)
             writer.endObject()
         }
-        if !contents.prompts.isEmpty {
+        if capabilities.contains(.prompts) {
             writer.key("prompts")
             writer.beginObject()
             writer.field("listChanged", true)
@@ -388,7 +387,7 @@ public final class Connection: Sendable {
         writer.key("logging")
         writer.beginObject()
         writer.endObject()
-        if Self.offersCompletions(contents) {
+        if capabilities.contains(.completions) {
             writer.key("completions")
             writer.beginObject()
             writer.endObject()
@@ -424,7 +423,7 @@ public final class Connection: Sendable {
                 throw MCPError.invalidRequest(
                     "JSON-RPC batches are not part of protocol revision \(profile.version.rawValue)")
             }
-            try requireCapability(for: method, era: profile.era)
+            try requireCapability(for: method, peer: peer)
             switch method {
             case "ping":
                 guard profile.hasPing else { throw MCPError.methodNotFound(method) }
@@ -460,23 +459,25 @@ public final class Connection: Sendable {
                 let uri: String
                 do { uri = try params.required("uri") } catch { throw MCPError.invalidParams(error) }
                 let budgets = configuration.budgets
-                let accepted: Bool = state.withLock { state in
-                    guard state.legacy != nil else { return true }
+                let refusal: MCPError? = state.withLock { state in
+                    guard state.legacy?.negotiated.contains(.resources) == true else { return .methodNotFound(method) }
                     let key = ExactString(uri)
                     if method == "resources/unsubscribe" {
                         if state.legacy?.resourceSubscriptions.remove(key) != nil {
                             releaseResourcesLocked([key], &state)
                             dropUnwantedEventsLocked(&state)
                         }
-                        return true
+                        return nil
                     }
-                    if state.legacy?.resourceSubscriptions.contains(key) == true { return true }
-                    guard resourcesFitLocked([key], state, budgets) else { return false }
+                    if state.legacy?.resourceSubscriptions.contains(key) == true { return nil }
+                    guard resourcesFitLocked([key], state, budgets) else {
+                        return .overloaded("too many resource subscriptions on this connection")
+                    }
                     state.legacy?.resourceSubscriptions.insert(key)
                     retainResourcesLocked([key], &state)
-                    return true
+                    return nil
                 }
-                guard accepted else { throw MCPError.overloaded("too many resource subscriptions on this connection") }
+                if let refusal { throw refusal }
                 respond(resultFrame(id: id, peer: peer) { _ in }, id: id, responder)
             case "subscriptions/listen":
                 guard profile.hasSubscriptionsListen else { throw MCPError.methodNotFound(method) }
@@ -517,11 +518,11 @@ public final class Connection: Sendable {
     }
 
     private func discover(id: RequestID, peer: Peer, responder: Responder) {
-        let registry = server.snapshot
+        let capabilities = server.snapshot.modernCapabilities
         let frame = resultFrame(id: id, peer: peer, cache: configuration.listCache) { writer in
             writer.field("supportedVersions", configuration.supportedVersions.map(\.rawValue))
             writer.key("capabilities")
-            writeCapabilities(to: &writer, registry: registry)
+            writeCapabilities(to: &writer, capabilities: capabilities)
             writer.field("instructions", configuration.instructions)
         }
         respond(frame, id: id, responder)
@@ -583,12 +584,10 @@ public final class Connection: Sendable {
     /// Methods of a capability the server does not advertise do not exist for the client: the
     /// specification answers them with "method not found", the same as an unknown method.
     ///
-    /// "Advertised" means what the server has now. For a session opened with `initialize` it
-    /// also means what that handshake announced: those capabilities were negotiated for the
-    /// session and do not lapse when the last tool or prompt is removed — `list_changed` invites
-    /// the client to ask again, and the answer is then an empty list, not an error.
-    private func requireCapability(for method: String, era: Era) throws(MCPError) {
-        let capability: Capability
+    /// Legacy sessions use the set announced at initialize. Modern clients can refresh any
+    /// list the server has offered, including one that has since become empty.
+    private func requireCapability(for method: String, peer: Peer) throws(MCPError) {
+        let capability: ServerCapability
         switch method {
         case "tools/list", "tools/call": capability = .tools
         case "resources/list", "resources/templates/list", "resources/read", "resources/subscribe",
@@ -598,22 +597,8 @@ public final class Connection: Sendable {
         case "completion/complete": capability = .completions
         default: return
         }
-        if Self.capabilities(of: server.snapshot.contents).contains(capability) { return }
-        if era == .legacy, state.withLock({ $0.legacy?.negotiated.contains(capability) ?? false }) { return }
-        throw .methodNotFound(method)
-    }
-
-    private static func capabilities(of contents: RegistryContents) -> Set<Capability> {
-        var result: Set<Capability> = []
-        if !contents.tools.isEmpty { result.insert(.tools) }
-        if !contents.resources.isEmpty || !contents.templates.isEmpty { result.insert(.resources) }
-        if !contents.prompts.isEmpty { result.insert(.prompts) }
-        if offersCompletions(contents) { result.insert(.completions) }
-        return result
-    }
-
-    private static func offersCompletions(_ contents: RegistryContents) -> Bool {
-        contents.prompts.contains(where: { $0.complete != nil }) || contents.templates.contains(where: { $0.complete != nil })
+        let advertised = peer.profile.era == .legacy ? peer.negotiatedServerCapabilities : server.snapshot.modernCapabilities
+        guard advertised.contains(capability) else { throw .methodNotFound(method) }
     }
 
     private func encodeList(
@@ -1589,8 +1574,10 @@ public final class Connection: Sendable {
     private func legacyWants(_ event: ServerEvent, _ state: State) -> Bool {
         // Legacy sessions get unsolicited notifications once the handshake is complete.
         guard let legacy = state.legacy, legacy.initialized else { return false }
-        if case .resourceUpdated(let uri) = event { return legacy.resourceSubscriptions.contains(ExactString(uri)) }
-        return true
+        return switch event {
+        case .listChanged(let kind): legacy.negotiated.contains(kind.capability)
+        case .resourceUpdated(let uri): legacy.resourceSubscriptions.contains(ExactString(uri))
+        }
     }
 
     private func wantsLocked(_ event: ServerEvent, _ state: State) -> Bool {
