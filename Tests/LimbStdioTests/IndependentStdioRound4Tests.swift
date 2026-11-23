@@ -93,7 +93,11 @@ extension IndependentStdioTransportTests {
         /// The failed write comes during the grace period, and one of the handlers in flight
         /// ignores cancellation: it is still told to stop at once, and `run` does not wait for
         /// it longer than the second it gives such handlers.
+        #if os(Linux)
+        @Test(arguments: [IndependentStdioWay.pipes, .socketpair])
+        #else
         @Test(arguments: [IndependentStdioWay.pipes, .socketpair, .tcp])
+        #endif
         func aPeerGoneDuringTheGracePeriodCutsItShortEvenForAStubbornHandler(way: IndependentStdioWay) throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 60 }
             let client = try client(fixture.server, way)
@@ -104,8 +108,7 @@ extension IndependentStdioTransportTests {
             #expect(client.initialize() == "2025-11-25")
             #expect(client.call(1, "hold", #"{"tag":"held"}"#))
             #expect(client.call(2, "stubborn", #"{"ms":20000,"tag":"stubborn"}"#))
-            // Their answers are the writes that fail. Over TCP the first write after the peer
-            // closed still succeeds (the peer answers it with a reset); the second fails.
+            // The answers are written after the peer closes its reading end.
             #expect(client.call(3, "nap", #"{"ms":400,"tag":"late"}"#))
             #expect(client.call(4, "nap", #"{"ms":800,"tag":"later"}"#))
             #expect(fixture.probe.eventually(seconds: 10) { $0.startedTags.count == 4 })

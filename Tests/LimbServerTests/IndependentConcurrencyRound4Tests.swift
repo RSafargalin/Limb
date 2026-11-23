@@ -387,21 +387,29 @@ struct IndependentConcurrencyKilobyteRuleTests {
         }
     }
 
-    /// "while draining, a peer that takes at least a kilobyte per `outputDrainSeconds` is still
-    /// reading". Here: one kilobyte per second with a limit of two.
+    private static var pipeProgressBytes: Int {
+        #if os(Linux)
+        Int(sysconf(Int32(_SC_PAGESIZE)))
+        #else
+        1024
+        #endif
+    }
+
+    /// A reader that frees a writable amount of space once per second stays within the
+    /// two-second drain limit.
     @Test func aPeerThatTakesAKilobytePerIntervalIsStillReading() async throws {
         let diagnostics = ICBox<[String]>([])
         let session = Session(try makeServer(drain: 2.0, diagnostics: diagnostics))
         await prepare(session)
-        // Slow: one kilobyte a second, until the writer is done.
+        // Slow: one read per second until the writer is done.
         var slowReads = 0
         while !session.returned.value, slowReads < 60 {
-            if session.read(limit: 1024, timeoutMilliseconds: 3000) < 0 { break }
+            if session.read(limit: Self.pipeProgressBytes, timeoutMilliseconds: 3000) < 0 { break }
             slowReads += 1
             try await Task.sleep(for: .seconds(1))
         }
         let gaveUp = diagnostics.value.filter { $0.contains("did not read") }
-        #expect(gaveUp.isEmpty, "given up after \(slowReads) reads of one kilobyte per second with a limit of two seconds")
+        #expect(gaveUp.isEmpty, "given up after \(slowReads) reads of \(Self.pipeProgressBytes) bytes per second with a limit of two seconds")
         #expect(session.returned.value, "run did not return after \(slowReads) slow reads")
         // The rest is in the pipe; the response arrives whole.
         while session.read(limit: 65536, timeoutMilliseconds: 2000) > 0 {}
@@ -1057,20 +1065,19 @@ struct IndependentConcurrencyDeferredMoreTests {
 // MARK: - The drain rule at its boundary
 
 extension IndependentConcurrencyKilobyteRuleTests {
-    /// Just above the rule: exactly one kilobyte per read, a read every two thirds of the limit
-    /// (1.5 KiB per `outputDrainSeconds`). Such a peer is still reading.
+    /// Each read frees a writable amount of space, every two thirds of the drain limit.
     @Test func aPeerJustAboveAKilobytePerIntervalIsStillReading() async throws {
         let diagnostics = ICBox<[String]>([])
         let session = Session(try makeServer(drain: 1.5, diagnostics: diagnostics))
         await prepare(session)
         var slowReads = 0
         while !session.returned.value, slowReads < 40 {
-            if session.read(limit: 1024, timeoutMilliseconds: 3000) < 0 { break }
+            if session.read(limit: Self.pipeProgressBytes, timeoutMilliseconds: 3000) < 0 { break }
             slowReads += 1
             try await Task.sleep(for: .seconds(1))
         }
         let gaveUp = diagnostics.value.filter { $0.contains("did not read") }
-        #expect(gaveUp.isEmpty, "given up after \(slowReads) reads of one kilobyte per second with a limit of 1.5 seconds")
+        #expect(gaveUp.isEmpty, "given up after \(slowReads) reads of \(Self.pipeProgressBytes) bytes per second with a limit of 1.5 seconds")
         #expect(session.returned.value)
         while session.read(limit: 65536, timeoutMilliseconds: 2000) > 0 {}
         #expect(session.received > Self.total)

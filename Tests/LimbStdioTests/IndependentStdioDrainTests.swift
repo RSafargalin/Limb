@@ -55,27 +55,43 @@ private func abandonedSession(socket: Bool, nonBlocking: Bool, drain: Double = 0
 private struct PacedOutcome {
     /// `run` logged that it gave up on the reader.
     var gaveUp: Bool
-    /// Kilobytes taken on schedule before `run` returned or gave up.
+    /// Scheduled read attempts before `run` returned or gave up.
     var steps: Int
     var log: [String]
     /// The reader that went on got the whole response, intact, and every line was valid.
     var intact: Bool
 }
 
-/// One response of `burst + channel capacity + 12 KiB` bytes, ready before the end of input. The
-/// client takes `burst` bytes at once and then exactly 1 KiB every `period`, on a fixed schedule
-/// (late steps do not push the later ones back), until `run` returns or gives up. Then it reads
-/// the rest quickly.
+/// A scheduled read frees at least one pipe buffer on Linux or enough of a socket's send
+/// buffer to let the writer proceed. On Darwin the fixture exercises the 1 KiB threshold.
+private func pacedReadSize(_ channel: IndependentStdioClient.Channel) -> Int {
+    #if os(Linux)
+    return channel == .pipes ? Int(sysconf(Int32(_SC_PAGESIZE))) : 16 * 1024
+    #else
+    return 1024
+    #endif
+}
+
+/// Take an initial burst and then one chunk every period until the server finishes or gives
+/// up. The reader then drains the remainder and verifies the response.
 private func pacedDrain(channel: IndependentStdioClient.Channel, nonBlocking: Bool, limit: Double, period: Double) throws -> PacedOutcome {
-    let burst = 80 * 1024
-    let capacity = channel == .pipes ? 64 * 1024 : 8 * 1024
-    let size = burst + capacity + 12 * 1024
+    let readSize = pacedReadSize(channel)
+    let burst = max(80 * 1024, readSize)
+    let capacity = channel == .pipes ? max(64 * 1024, 16 * readSize) : 16 * 1024
+    let size = burst + capacity + 12 * readSize
     let fixture = try independentStdioFixture { $0.outputDrainSeconds = limit }
     #if canImport(Darwin)
     let before = Set(independentStdioTransportThreads().map(\.id))
     #endif
     let client = Client(fixture.server, channel: channel)
     defer { client.tearDown() }
+    #if os(Linux)
+    if channel == .socketpair {
+        // Linux doubles SO_SNDBUF. A scheduled read can free the whole requested buffer.
+        var sendBuffer: Int32 = 8 * 1024
+        try #require(setsockopt(client.serverOutput, SOL_SOCKET, SO_SNDBUF, &sendBuffer, socklen_t(MemoryLayout<Int32>.size)) == 0)
+    }
+    #endif
     if nonBlocking { independentStdioSetNonBlocking(client.serverOutput) }
     client.start()
     #expect(client.initialize() == "2025-11-25")
@@ -90,6 +106,7 @@ private func pacedDrain(channel: IndependentStdioClient.Channel, nonBlocking: Bo
         if count == 0 { usleep(500) }
         taken += count
     }
+    try #require(taken == burst, "The reader could not establish the initial burst")
     // The writer fills the channel again in no time; from here on it is blocked.
     usleep(20_000)
     var steps = 0
@@ -103,7 +120,7 @@ private func pacedDrain(channel: IndependentStdioClient.Channel, nonBlocking: Bo
         if client.hasReturned { break }
         let wait = start.addingTimeInterval(Double(steps + 1) * period).timeIntervalSinceNow
         if wait > 0 { usleep(useconds_t(wait * 1e6)) }
-        client.absorb(limit: 1024)
+        client.absorb(limit: readSize)
         steps += 1
     }
     let answer = client.responses(to: [1], timeout: 30)[1]
@@ -263,23 +280,22 @@ extension IndependentStdioTransportTests {
         }
 
         @Test(arguments: [IndependentStdioClient.Channel.pipes, .socketpair], [false, true])
-        func aReaderTakingAKilobytePerLimitOrMoreIsWaitedFor(channel: IndependentStdioClient.Channel, nonBlocking: Bool) throws {
+        func aReaderMakingProgressWithinEachLimitIsWaitedFor(channel: IndependentStdioClient.Channel, nonBlocking: Bool) throws {
             for fraction in [0.5, 0.8] {
                 let outcome = try pacedDrain(channel: channel, nonBlocking: nonBlocking, limit: 0.5, period: 0.5 * fraction)
-                #expect(!outcome.gaveUp, "\(channel), non-blocking \(nonBlocking): run gave up on a reader taking 1 KiB every \(0.5 * fraction) s after \(outcome.steps) steps; the rule is 1 KiB per 0.5 s. Log: \(outcome.log)")
+                #expect(!outcome.gaveUp, "\(channel), non-blocking \(nonBlocking): run gave up on a reader taking \(pacedReadSize(channel)) bytes every \(0.5 * fraction) s after \(outcome.steps) steps. Log: \(outcome.log)")
                 #expect(outcome.steps >= 5, "the writer was not blocked long enough to say anything (\(outcome.steps) steps)")
                 #expect(outcome.intact)
             }
         }
 
-        /// Below the rule (one kilobyte per 1.25 and 2 limits) the writer stands still for longer
-        /// than the limit between two pieces: `run` gives up, logs it once, and the writer left
-        /// behind still delivers everything to the reader that goes on.
+        /// With one read per 1.25 or 2 limits, the writer stalls for longer than the limit.
+        /// The server gives up, logs once, and the reader can still collect the whole response.
         @Test(arguments: [IndependentStdioClient.Channel.pipes, .socketpair], [false, true])
-        func aReaderTakingLessThanAKilobytePerLimitIsGivenUpOn(channel: IndependentStdioClient.Channel, nonBlocking: Bool) throws {
+        func aReaderMakingNoProgressDuringTheLimitIsGivenUpOn(channel: IndependentStdioClient.Channel, nonBlocking: Bool) throws {
             for fraction in [1.25, 2.0] {
                 let outcome = try pacedDrain(channel: channel, nonBlocking: nonBlocking, limit: 0.5, period: 0.5 * fraction)
-                #expect(outcome.gaveUp, "\(channel), non-blocking \(nonBlocking): run waited for a reader taking 1 KiB every \(0.5 * fraction) s")
+                #expect(outcome.gaveUp, "\(channel), non-blocking \(nonBlocking): run waited for a reader taking \(pacedReadSize(channel)) bytes every \(0.5 * fraction) s")
                 #expect(outcome.log.count == 1 && outcome.log.first?.contains("did not read") == true, "\(outcome.log)")
                 #expect(outcome.intact)
             }
