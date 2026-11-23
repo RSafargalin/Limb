@@ -43,6 +43,8 @@ function selectCounts(value, keys) {
 export function summarizeReleaseLoad(result) {
   const totals = selectCounts(result, [...counters, "plannedStarts", "droppedSlots"]);
   if (!totals) return undefined;
+  const wire = summarizeWire(result.wire);
+  if (wire) totals.wire = wire;
   if (!Array.isArray(result.steps) || result.steps.length !== releaseLoadScenario.length) return totals;
 
   const steps = releaseLoadScenario.map(({ name }) => {
@@ -51,6 +53,21 @@ export function summarizeReleaseLoad(result) {
     return counts && { name, ...counts };
   });
   return steps.every(Boolean) ? { ...totals, steps } : totals;
+}
+
+function summarizeWire(wire) {
+  if (!wire || !Number.isSafeInteger(wire.matched) || wire.matched < 0) return undefined;
+  const { matched, startWindowMs, p50Ms, p95Ms } = wire;
+  if (![startWindowMs, p50Ms, p95Ms].every((value) => Number.isFinite(value) && value >= 0)) return undefined;
+  return { matched, startWindowMs, p50Ms, p95Ms };
+}
+
+export function assertReleaseWireEvidence(load) {
+  const wire = load?.wire;
+  assert.ok(wire, "Missing independently observed stdio load results");
+  assert.equal(wire.matched, load.requests, "Independently matched result count differs from Inspector");
+  assert.ok(wire.startWindowMs >= (releaseLoadProfile.durationSeconds - 1) * 1_000, "Incomplete wire start window");
+  assert.ok(wire.p50Ms <= wire.p95Ms, "Inconsistent round-trip percentiles");
 }
 
 export function assertReleaseLoadSummary(load) {

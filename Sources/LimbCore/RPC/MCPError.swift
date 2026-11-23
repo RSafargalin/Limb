@@ -1,6 +1,7 @@
 /// A JSON-RPC error object.
 ///
 /// Throw one from a handler to answer with a protocol error instead of a result.
+/// On modern MCP, Limb maps reserved codes that do not apply to the operation to internal error.
 public struct MCPError: Error, Sendable, Equatable, CustomStringConvertible {
     public var code: Int
     public var message: String

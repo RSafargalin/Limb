@@ -438,12 +438,10 @@ private nonisolated func round2MainDefinitions() -> [ToolDefinition] {
 
 /// Sends requests with extreme numbers in every place the server hashes, compares or converts
 /// a number (request id, progress token, the id in a cancellation, integer and number arguments,
-/// `_meta` values) and returns what differs from the expected answers. The default codec keeps
-/// the numbers; the fallback codec refuses, while parsing, numbers it cannot hold (it answers
-/// with a parse error, id null), and accepts the others as Doubles.
+/// `_meta` values) and returns what differs from the expected answers. Both codecs preserve
+/// numeric input before the tool converts it to its declared argument type.
 private func round2ExtremeNumbersOnTheWire() async -> [String] {
     var problems: [String] = []
-    let foundation = JSON.codec == .foundation
     let server = try! Server(name: "wire", version: "1") {
         R2MHalf()
         R2MWhole()
@@ -451,22 +449,18 @@ private func round2ExtremeNumbersOnTheWire() async -> [String] {
     }
     let client = TestClient(server)
     func next() async -> JSONValue? { try? await client.next(timeout: .seconds(5)) }
-    func isParseError(_ message: JSONValue?) -> Bool { message?["error"]?["code"] == -32700 && message?["id"] == .null }
     let texts = ["1e9999999999999999999", "-1e9999999999999999999", "1e-9999999999999999999", "4e4000000000000000000", "-4e-4000000000000000000",
         "1e9223372036854775807", "1e9223372036854775808", "1e" + String(repeating: "9", count: 30), "0e" + String(repeating: "9", count: 30),
         "-0.000e-99999999999999999999", "1e00000000000000000000000000005", String(repeating: "7", count: 4000) + "e-4000000000000000000",
         "9223372036854775807", "-9223372036854775808", "9223372036854775808", "1e400", "2.5e-400", "1e18", "123.0"]
     for text in texts {
         let number = JSONNumber(lexeme: text)!
-        // The number as the server's codec reads it: the fallback refuses some (parse error,
-        // id null) and turns the others into Doubles.
-        let parsed = (try? JSON.parse(text))?.numberValue
-        let foundationRefuses = foundation && parsed == nil
-        let seen = parsed ?? number
-        let double = seen.doubleValue
+        if (try? JSON.parse(text))?.numberValue?.description != text {
+            problems.append("parse \(text): number spelling changed or was rejected")
+        }
+        let double = number.doubleValue
         func check(_ label: String, _ message: JSONValue?, _ expected: (JSONValue?) -> Bool) {
-            let fine = foundationRefuses ? isParseError(message) : expected(message)
-            if !fine { problems.append("\(label) \(text): \(String(describing: message))") }
+            if !expected(message) { problems.append("\(label) \(text): \(String(describing: message))") }
         }
         // The number as a request id (only integers: the test client refuses other ids).
         if number.isInteger {
@@ -476,7 +470,7 @@ private func round2ExtremeNumbersOnTheWire() async -> [String] {
         // As an integer argument.
         _ = client.post("tools/call", ["name": "r2_m_whole", "arguments": ["n": .number(number)]])
         check("integer", await next()) { message in
-            let expected = seen.isInteger ? seen.intValue : nil
+            let expected = number.isInteger ? number.intValue : nil
             if let expected { return message?["result"]?["structuredContent"] == JSONValue(expected) }
             return message?["result"]?["isError"] == true
         }
@@ -488,15 +482,16 @@ private func round2ExtremeNumbersOnTheWire() async -> [String] {
         }
         // As a progress token, and as a value in `_meta`.
         _ = client.post("tools/call", ["name": "r2_m_progress"], meta: ["progressToken": .number(number), "x": [.number(number)]])
-        let progress = await next()
-        check("progress", progress) { $0?["method"] == "notifications/progress" && $0?["params"]?["progressToken"]?.numberValue == seen }
-        if !foundationRefuses {
-            let done = await next()
-            if done?["result"]?["isError"] != false { problems.append("progress \(text), response: \(String(describing: done))") }
+        if number.isInteger {
+            let progress = await next()
+            if progress?["method"] != "notifications/progress" || progress?["params"]?["progressToken"]?.numberValue?.description != text {
+                problems.append("progress \(text): \(String(describing: progress))")
+            }
         }
+        let done = await next()
+        if done?["result"]?["isError"] != false { problems.append("progress \(text), response: \(String(describing: done))") }
         // As the id in a cancellation: nothing to cancel; the server still answers afterwards.
         client.notify("notifications/cancelled", ["requestId": .number(number)])
-        if foundationRefuses, !isParseError(await next()) { problems.append("cancel \(text)") }
         let after = client.post("tools/list")
         let pong = await next()
         if pong?["id"] != after.json || pong?["result"] == nil { problems.append("after \(text): \(String(describing: pong))") }
@@ -521,8 +516,7 @@ private func round2ExtremeNumbersOnTheWire() async -> [String] {
 
 /// Calls a tool whose argument is a `Double` with long numbers, in a child process: 20,000
 /// digits, and four megabytes. Exits with status 3 on a wrong answer, so that it is told apart
-/// from a trap. The default codec answers with the correctly rounded value (halved); the
-/// fallback refuses such texts while parsing (parse error, id null).
+/// from a trap. Both codecs let the tool convert the complete number to Double and halve it.
 private func round2LongNumbersForADouble() async {
     let server = try! Server(name: "wire", version: "1") { R2MHalf() }
     let client = TestClient(server)
@@ -536,11 +530,7 @@ private func round2LongNumbersForADouble() async {
     for (text, half) in zip(texts, expected) {
         _ = client.post("tools/call", ["name": "r2_m_half", "arguments": ["x": .number(JSONNumber(lexeme: text)!)]])
         let answer = try? await client.next(timeout: .seconds(10))
-        if JSON.codec == .limb {
-            if answer?["result"]?["structuredContent"]?.doubleValue != half { exit(3) }
-        } else if answer?["error"]?["code"] != -32700 {
-            exit(3)
-        }
+        if answer?["result"]?["structuredContent"]?.doubleValue != half { exit(3) }
     }
     await client.close()
 }

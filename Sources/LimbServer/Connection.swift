@@ -493,15 +493,13 @@ public final class Connection: Sendable {
                     do {
                         var result = try await handler(params, context)
                         let userMeta = result.removeValue(forKey: "_meta")?.objectValue
-                        // A custom method may name its own result type (extensions are allowed to
-                        // add values); it replaces the default instead of appearing twice.
-                        var resultType = "complete"
-                        if peer.profile.resultTypeRequired,
-                            let custom = result.removeValue(forKey: "resultType")?.stringValue
+                        if peer.profile.resultTypeRequired, let type = result.removeValue(forKey: "resultType"),
+                            type != .string("complete")
                         {
-                            resultType = custom
+                            report(.handlerFailed, "\(peerText(method)) #\(peerText(id.description)) returned an unsupported resultType")
+                            return Frame.error(id: id, .internalError())
                         }
-                        return resultFrame(id: id, peer: peer, userMeta: userMeta, resultType: resultType) { writer in
+                        return resultFrame(id: id, peer: peer, userMeta: userMeta) { writer in
                             for (key, value) in result {
                                 writer.key(key)
                                 writer.write(value)
@@ -941,6 +939,13 @@ public final class Connection: Sendable {
             }
             return Frame.error(id: id, error)
         case let error as MCPError:
+            if peer.profile.era == .modern,
+                error.code == MCPError.Code.legacyResourceNotFound || (-32099 ... -32020).contains(error.code),
+                !context.inputState.reportedMissingCapability(error)
+            {
+                report(.handlerFailed, "\(peerText(context.method)) #\(peerText(id.description)) threw an inapplicable MCP error code \(error.code)")
+                return Frame.error(id: id, .internalError())
+            }
             return Frame.error(id: id, error)
         case is CancellationError:
             return Task.isCancelled ? nil : Frame.error(id: id, .internalError("Request was cancelled internally"))

@@ -52,22 +52,22 @@ private let serverInfoKey = "io.modelcontextprotocol/serverInfo"
         #expect(failed.code == 12345 && failed["error"]?["message"] == "custom failure" && failed["error"]?["data"] == "details")
     }
 
-    /// A result object has one `resultType` (JSON objects with duplicate names are not
-    /// interoperable, RFC 8259 §4, and Limb's own parser refuses them). A custom handler may well
-    /// return the member itself: "Extensions MAY add additional ResultType values"
-    /// (`2026-07-28/basic/index.mdx`).
-    @Test func aCustomResultThatNamesItsResultTypeIsStillOneObject() async throws {
+    /// The wire response has exactly one discriminator whether the handler supplies `complete` or
+    /// leaves the discriminator for the server to supply.
+    @Test func aCustomResultHasExactlyOneCompleteDiscriminator() async throws {
         let server = Server(name: "custom", version: "1")
         try server.register(method: "acme/typed") { _, _ in ["resultType": "complete", "value": 1] }
-        try server.register(method: "acme/extension") { _, _ in ["resultType": "com.example/partial", "value": 2] }
+        try server.register(method: "acme/ordinary") { _, _ in ["value": 2] }
         let peer = IndependentProtocolRawPeer(server)
-        for (method, expected) in [("acme/typed", "complete"), ("acme/extension", "com.example/partial")] {
-            let frames = await peer.send(#"{"jsonrpc":"2.0","id":1,"method":"\#(method)","params":{\#(IndependentProtocol.modernMetaText)}}"#, awaiting: 1)
+        for (id, method) in [(1, "acme/typed"), (2, "acme/ordinary")] {
+            let frames = await peer.send(#"{"jsonrpc":"2.0","id":\#(id),"method":"\#(method)","params":{\#(IndependentProtocol.modernMetaText)}}"#, awaiting: 1)
             let frame = try #require(frames.first)
             let occurrences = frame.components(separatedBy: #""resultType":"#).count - 1
             #expect(occurrences == 1, "resultType appears \(occurrences) times: \(frame)")
+            #expect(IndependentProtocolRawPeer.idText(of: frame) == String(id))
             let result = IndependentProtocolRawPeer.foundationObject(frame)?["result"] as? [String: Any]
-            #expect(result?["resultType"] as? String == expected, "\(frame)")
+            #expect(result?["resultType"] as? String == "complete", "\(frame)")
+            #expect(result?["value"] as? Int == id, "\(frame)")
         }
     }
 

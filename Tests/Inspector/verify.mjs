@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { renameSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/client";
@@ -9,11 +10,13 @@ import { assertFixtureRevisions, codecs, requiredChecks, revisions } from "./mat
 import { checkLiveConnection, checkResourceNotifications } from "./verify-live.mjs";
 import { checkReleaseLoad, releaseLoadProfile, releaseLoadScenario, summarizeReleaseLoad } from "./verify-release-load.mjs";
 import { checkProgressAndCancellation } from "./verify-steps.mjs";
+import { checkWireLoad } from "./verify-wire-load.mjs";
 
 const launcher = fileURLToPath(new URL(
   "./node_modules/@modelcontextprotocol/inspector/clients/launcher/build/index.js",
   import.meta.url,
 ));
+const traceLauncher = fileURLToPath(new URL("./trace-stdio.mjs", import.meta.url));
 const echoText = 'Привет, 世界 🌿 "quoted" \\path\nsecond line\tend';
 const timeout = 5_000;
 const [binary, codec, resultsDirectory] = process.argv.slice(2);
@@ -30,11 +33,12 @@ assert.ifError(fixtureVersions.error);
 assert.equal(fixtureVersions.status, 0, `Could not read the fixture's supported MCP revisions: ${fixtureVersions.stderr}`);
 assertFixtureRevisions(fixtureVersions.stdout.trimEnd().split(/\r?\n/));
 
-function inspect({ version, era }, method, options = [], expectedStatus = 0, processTimeout = 15_000, observeResult) {
+function inspect({ version, era }, method, options = [], expectedStatus = 0, processTimeout = 15_000, observeResult, tracePath) {
+  const server = tracePath === undefined ? [binary, version] : [process.execPath, traceLauncher, binary, version, tracePath];
   const invocation = spawnSync(process.execPath, [
     launcher, "--cli", "--protocol-era", era, "--format", "json",
     "--connect-timeout", String(timeout), "--stored-auth-only", "--method", method,
-    ...options, "--", binary, version,
+    ...options, "--", ...server,
   ], {
     encoding: "utf8",
     timeout: processTimeout,
@@ -79,6 +83,22 @@ function inspect({ version, era }, method, options = [], expectedStatus = 0, pro
     [diagnostic] = envelopes;
   }
   return { result, diagnostic };
+}
+
+function inspectRecordedLoad(revision, options, { processTimeout, observeResult, mixed = false } = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "limb-inspector-wire."));
+  try {
+    const path = join(directory, "trace.json");
+    const { result } = inspect(revision, "tools/call", options, 0, processTimeout, observeResult, path);
+    const wire = checkWireLoad(JSON.parse(readFileSync(path, "utf8")), result, {
+      modern: revision.era === "modern",
+      mixed,
+      minimumStartWindowMs: mixed ? (releaseLoadProfile.durationSeconds - 1) * 1_000 : 0,
+    });
+    return { result, wire };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function textContent(result) {
@@ -206,7 +226,7 @@ async function verify(revision) {
   }
 
   await check("short-load", () => {
-    const { result } = inspect(revision, "tools/call", [
+    const { result } = inspectRecordedLoad(revision, [
       "--tool-name", "echo", "--tool-arg", "text=inspector-load-{{seq}}",
       "--load", "--load-requests", "20", "--load-concurrency", "4",
       "--load-max-error-rate", "0",
@@ -236,10 +256,15 @@ async function verify(revision) {
     console.log(`[${label}] ${durationSeconds}s mixed Inspector load`);
     await check("sustained-load", async () => {
       await checkReleaseLoad(
-        (options) => inspect(revision, "tools/call", options, 0, durationSeconds * 1000 + 15_000, (result) => {
-          load = summarizeReleaseLoad(result);
-          checkpoint();
-        }).result,
+        (options) => {
+          const { result, wire } = inspectRecordedLoad(revision, options, {
+            mixed: true,
+            processTimeout: durationSeconds * 1000 + 15_000,
+            observeResult: (observed) => { load = summarizeReleaseLoad(observed); checkpoint(); },
+          });
+          load = { ...load, wire };
+          return result;
+        },
         scenarioPath,
       );
     });

@@ -838,7 +838,7 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
             ("plain", ["v": 1]), ("typed", ["resultType": "complete", "v": 1]), ("extension", ["v": 1, "resultType": "com.example/partial"]),
             ("number", ["resultType": 5]), ("null", ["resultType": nil]), ("object", ["resultType": ["a": 1]]), ("empty", ["resultType": ""]),
             ("meta", ["_meta": ["a": 1], "v": 1]), ("metaString", ["_meta": "text"]), ("metaInfo", ["_meta": ["io.modelcontextprotocol/serverInfo": ["name": "impostor", "version": "0"]]]),
-            ("cache", ["ttlMs": 5, "cacheScope": "public"]), ("everything", ["resultType": "x", "_meta": ["k": "v"], "ttlMs": 1, "cacheScope": "private", "jsonrpc": "1.0", "id": 9, "result": [:], "error": nil]),
+            ("cache", ["ttlMs": 5, "cacheScope": "public"]), ("everything", ["resultType": revision.isModern ? "complete" : "x", "_meta": ["k": "v"], "ttlMs": 1, "cacheScope": "private", "jsonrpc": "1.0", "id": 9, "result": [:], "error": nil]),
         ]
         for (name, result) in results { try server.register(method: "acme/\(name)") { _, _ in result } }
         let peer = IndependentProtocolRawPeer(server)
@@ -849,13 +849,16 @@ private func initializeFrame(_ revision: IndependentProtocolRevision) -> String 
             let frame = try #require(frames.first)
             #expect(IndependentProtocolRawPeer.duplicateMembers(in: frame).isEmpty, "\(revision.rawValue) acme/\(name): repeated \(IndependentProtocolRawPeer.duplicateMembers(in: frame)) in \(frame)")
             let object = try #require(IndependentProtocolRawPeer.foundationObject(frame), "\(frame)")
+            if revision.isModern, let type = returned["resultType"], type != "complete" {
+                #expect(Set(object.keys) == ["jsonrpc", "id", "error"], "\(frame)")
+                let error = try #require(object["error"] as? [String: Any], "\(frame)")
+                #expect(error["code"] as? Int == -32603, "\(frame)")
+                continue
+            }
             #expect(Set(object.keys) == ["jsonrpc", "id", "result"], "\(frame)")
             let result = try #require(object["result"] as? [String: Any], "\(frame)")
             if revision.isModern {
-                // `resultType: string` is required of every result; a handler's own string is kept.
-                let type = result["resultType"] as? String
-                #expect(type != nil, "\(frame)")
-                if let own = returned["resultType"]?.stringValue { #expect(type == own, "\(frame)") }
+                #expect(result["resultType"] as? String == "complete", "\(frame)")
                 let info = (result["_meta"] as? [String: Any])?["io.modelcontextprotocol/serverInfo"] as? [String: Any]
                 #expect(info?["name"] as? String == "rich", "\(frame)")
             } else {

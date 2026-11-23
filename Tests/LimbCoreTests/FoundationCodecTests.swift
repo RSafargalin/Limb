@@ -60,8 +60,6 @@ private struct SplitMix64: RandomNumberGenerator {
 
     /// The constant is not just the same `#if` echoed back: it agrees with what the parser does.
     @Test func codecMatchesTheBehaviour() {
-        let keepsNumberText = (try? JSON.parse("1E+2"))?.description == "1E+2"
-        #expect(keepsNumberText == (JSON.codec == .limb))
         let acceptsTrailingComma = (try? JSON.parse("[1,]")) != nil
         #expect(acceptsTrailingComma == (JSON.codec == .foundation))
         let acceptsDuplicateKeys = (try? JSON.parse(#"{"a":1,"a":2}"#)) != nil
@@ -462,63 +460,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
 /// The list of things the fallback does differently on purpose. Each one is pinned here so that
 /// it is a tested property of the build, not a footnote.
 @Suite struct FoundationCodecDifferenceTests {
-    // 1. Number text is not preserved. An integer that fits Int64 or UInt64 is exact; every
-    //    other number is a Double.
-    static let numberTexts: [(text: String, written: String)] = [
-        // Integers in the Int64 and UInt64 range are exact.
-        ("0", "0"), ("-0", "0"), ("7", "7"), ("-7", "-7"),
-        ("9223372036854775807", "9223372036854775807"), ("-9223372036854775808", "-9223372036854775808"),
-        ("9223372036854775808", "9223372036854775808"), ("18446744073709551615", "18446744073709551615"),
-        ("9007199254740993", "9007199254740993"), ("1000000000000000000", "1000000000000000000"),
-        ("10000000000000000000", "10000000000000000000"),
-        // One step outside that range the number is a Double, and says so when written back.
-        ("18446744073709551616", "1.8446744073709552e+19"), ("18446744073709551617", "1.8446744073709552e+19"),
-        ("-9223372036854775809", "-9.223372036854776e+18"), ("-18446744073709551615", "-1.8446744073709552e+19"),
-        ("-18446744073709551616", "-1.8446744073709552e+19"), ("100000000000000000000", "1e+20"),
-        ("99999999999999999999", "1e+20"), ("12345678901234567890123", "1.2345678901234568e+22"),
-        ("123456789012345678901234567890", "1.2345678901234568e+29"),
-        ("-123456789012345678901234567890", "-1.2345678901234568e+29"),
-        // Everything with a fraction or an exponent is a Double, written the way Swift prints one.
-        ("0.1", "0.1"), ("-1.5", "-1.5"), ("1.5e3", "1500.0"), ("1e2", "100.0"), ("1E2", "100.0"),
-        ("1e+2", "100.0"), ("1E+2", "100.0"), ("1e-2", "0.01"), ("1.0", "1.0"), ("1.10", "1.1"),
-        ("100.0", "100.0"), ("0.0", "0.0"), ("-0.0", "-0.0"), ("0e0", "0.0"), ("-0e0", "-0.0"), ("1e0", "1.0"),
-        ("1e01", "10.0"), ("15e-1", "1.5"), ("0.1e-7", "1e-08"), ("0.30000000000000004", "0.30000000000000004"),
-        ("1e19", "1e+19"), ("1e308", "1e+308"), ("1.7976931348623157e308", "1.7976931348623157e+308"),
-        ("12345678901234567e3", "1.2345678901234567e+19"), ("5e-324", "5e-324"), ("4.9e-324", "5e-324"),
-        ("9007199254740993.0", "9007199254740992.0"),
-        // Also when the digits spell an integer that would have fitted.
-        ("18446744073709551615.0", "1.8446744073709552e+19"), ("9223372036854775807.0", "9.223372036854776e+18"),
-        ("1.00000000000000000000", "1.0"), ("0.10000000000000000000", "0.1"), ("100000000000000000000.0", "1e+20"),
-        ("7e0", "7.0"), ("7.0", "7.0"), ("70e-1", "7.0"),
-        // Below the smallest Double the value collapses to zero without an error.
-        ("1e-400", "0.0"),
-    ]
-
-    @Test(arguments: numberTexts.indices)
-    func numberTextIsNotPreserved(_ index: Int) throws {
-        let (text, expected) = Self.numberTexts[index]
-        let value = try JSON.parse(text)
-        #expect(value.numberValue != nil)
-        #expect(value.description == expected, "\(text)")
-        // Whatever is written back is itself a JSON number, and reading it changes nothing more.
-        #expect(JSONNumber(lexeme: value.description) != nil, "\(text)")
-        let again = try JSON.parse(value.encoded())
-        #expect(again == value, "\(text)")
-        #expect(again.description == value.description, "\(text)")
-        // The same through the byte entry point and inside containers.
-        #expect(try JSON.parse(Array(text.utf8)).description == expected, "\(text)")
-        #expect(try JSON.parse("[\(text)]")[0]?.description == expected, "\(text)")
-        #expect(try JSON.parse("{\"n\":\(text)}")["n"]?.description == expected, "\(text)")
-    }
-
-    // 2. Numbers out of Double range are rejected, although they are valid JSON.
-    @Test(arguments: ["1e400", "-1e400", "1E400", "1e+400", "2e308", "1.7976931348623159e308", "1e1000", "[1e400]", #"{"n":1e400}"#])
-    func numbersBeyondDoubleRangeAreRejected(_ text: String) {
-        #expect(outcome(text).error != nil)
-        #expect(outcome(Array(text.utf8)).error != nil)
-    }
-
-    // 3. Trailing commas.
+    // Trailing commas.
     @Test func trailingCommasAreAccepted() throws {
         #expect(try JSON.parse("[1,]") == [1])
         #expect(try JSON.parse("[1 , ]") == [1])
@@ -541,7 +483,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(outcome(text).error == syntaxError)
     }
 
-    // 4. Duplicate keys.
+    // Duplicate keys.
     @Test func duplicateKeysAreNotDetected() throws {
         let cases: [(text: String, key: String, candidates: [JSONValue], count: Int)] = [
             (#"{"a":1,"a":2}"#, "a", [1, 2], 1),
@@ -580,7 +522,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
     }
     #endif
 
-    // 5. Member order is not preserved; equality never depended on it.
+    // Member order is not preserved; equality never depended on it.
     @Test func membersSurviveInSomeOrder() throws {
         let names = (0..<50).map { "member\($0)" }
         let text = "{" + names.enumerated().map { "\"\($1)\":\($0)" }.joined(separator: ",") + "}"
@@ -594,10 +536,10 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(try JSON.parse(value.encoded()) == value)
     }
 
-    // 6. Errors carry no position and no reason.
+    // Errors carry no position and no reason.
     @Test(arguments: [
         "", " ", "[1 2]", "01", "nul", #"{"a"}"#, "[", "{", #""abc"#, "1 2", "[1]]", "NaN", "'a'", #""\x""#,
-        #""\ud800""#, "\"a\nb\"", "1e400",
+        #""\ud800""#, "\"a\nb\"",
     ])
     func syntaxErrorsAreAllTheSame(_ text: String) {
         #expect(outcome(text).error == syntaxError)
@@ -613,7 +555,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(outcome("[1,2,3]", JSONParseOptions(maxNodes: 3)).error == Refusal(kind: .nodeLimitExceeded(3), offset: 0))
     }
 
-    // 7. `maxDepth` cannot be raised above 128.
+    // `maxDepth` cannot be raised above 128.
     @Test func maxDepthCannotBeRaisedAboveTheCeiling() {
         let arrays = nested("[", "]", 129)
         let objects = nested("{\"a\":", "}", 129, around: "1")
@@ -625,7 +567,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         }
     }
 
-    // 8. `maxNodes` is enforced, only later than in the default codec.
+    // `maxNodes` is enforced, only later than in the default codec.
     @Test func nodeLimitIsEnforced() {
         func zeros(_ count: Int) -> String { "[" + Array(repeating: "0", count: count).joined(separator: ",") + "]" }
         // The array is a value too: 49 zeros make 50 nodes.
@@ -645,35 +587,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(outcome(zeros(1_000_000)).error == Refusal(kind: .nodeLimitExceeded(1_000_000), offset: 0))
     }
 
-    // 9. Some valid numbers inside Double range are refused. This is `JSONSerialization` on
-    //    macOS 27: past about 17 significant digits it reads the number as a decimal, whose
-    //    exponent range is far narrower than a Double's, and reports an error instead of falling
-    //    back. The default codec accepts every one of these, and so does `Double(_:)`.
-    static let refusedInsideDoubleRange: [String] = [
-        "1.2345678901234567890123e200", "1.2345678901234567890123e-130", "12345678901234567890123e-150",
-        "4.940656458412465442e-324", "1" + String(repeating: "0", count: 166),  // an integer of 167 digits
-        "1" + String(repeating: "0", count: 300), "-1" + String(repeating: "0", count: 200),
-        "[1,1.2345678901234567890123e200]", #"{"n":1.2345678901234567890123e-130}"#,
-    ]
-
-    @Test(arguments: refusedInsideDoubleRange)
-    func someNumbersInsideDoubleRangeAreRejected(_ text: String) {
-        if let value = Double(text) { #expect(value.isFinite) }
-        #expect(outcome(text).error == syntaxError, "\(text.prefix(40)) (\(text.utf8.count) bytes)")
-        #expect(outcome(Array(text.utf8)).error == syntaxError)
-    }
-
-    /// The edge of that behaviour, so that a change in Foundation is noticed: the same digits with
-    /// a smaller exponent, and an integer one digit shorter, are read.
-    @Test func theSameNumbersCloserToOneAreAccepted() {
-        #expect(outcome("1.2345678901234567890123e100").value?.doubleValue != nil)
-        #expect(outcome("1.2345678901234567890123e-100").value?.doubleValue != nil)
-        #expect(outcome("1" + String(repeating: "0", count: 165)).value?.doubleValue != nil)  // 166 digits
-        #expect(outcome("1.2345678901234567e200").value?.doubleValue == 1.2345678901234567e200)
-        #expect(outcome("1e300").value?.doubleValue == 1e300)
-    }
-
-    // 10. A string that starts with U+FEFF is refused, value or key, raw or escaped: valid JSON
+    // A string that starts with U+FEFF is refused, value or key, raw or escaped: valid JSON
     //     that this codec cannot hand back unchanged. `FoundationCodecStringTests` attacks the check.
     @Test func stringsStartingWithAByteOrderMarkAreRejected() {
         #expect(outcome("\"\u{FEFF}text\"").error == Refusal(kind: .malformed, offset: 0))
@@ -819,6 +733,62 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
 // MARK: Numbers
 
 @Suite struct FoundationCodecNumberTests {
+    static let numberTexts = [
+        "0", "-0", "7", "-7", "9223372036854775807", "-9223372036854775808",
+        "9223372036854775808", "18446744073709551615", "9007199254740993", "1000000000000000000", "10000000000000000000", "18446744073709551616",
+        "18446744073709551617", "-9223372036854775809", "-18446744073709551615", "-18446744073709551616", "100000000000000000000", "99999999999999999999",
+        "12345678901234567890123", "123456789012345678901234567890", "-123456789012345678901234567890", "0.1", "-1.5", "1.5e3",
+        "1e2", "1E2", "1e+2", "1E+2", "1e-2", "1.0",
+        "1.10", "100.0", "0.0", "-0.0", "0e0", "-0e0",
+        "1e0", "1e01", "15e-1", "0.1e-7", "0.30000000000000004", "1e19",
+        "1e308", "1.7976931348623157e308", "12345678901234567e3", "5e-324", "4.9e-324", "9007199254740993.0",
+        "18446744073709551615.0", "9223372036854775807.0", "1.00000000000000000000", "0.10000000000000000000", "100000000000000000000.0", "7e0",
+        "7.0", "70e-1", "1e-400",
+    ]
+
+    @Test(arguments: numberTexts)
+    func numberTextSurvivesParsingAndWriting(_ text: String) throws {
+        let value = try JSON.parse(text)
+        #expect(value.numberValue != nil)
+        #expect(value.description == text, "\(text)")
+        // Whatever is written back is itself a JSON number, and reading it changes nothing more.
+        #expect(JSONNumber(lexeme: value.description) != nil, "\(text)")
+        let again = try JSON.parse(value.encoded())
+        #expect(again == value, "\(text)")
+        #expect(again.description == value.description, "\(text)")
+        // The same through the byte entry point and inside containers.
+        #expect(try JSON.parse(Array(text.utf8)).description == text, "\(text)")
+        #expect(try JSON.parse("[\(text)]")[0]?.description == text, "\(text)")
+        #expect(try JSON.parse("{\"n\":\(text)}")["n"]?.description == text, "\(text)")
+    }
+
+    @Test(arguments: ["1e400", "-1e400", "1E400", "1e+400", "2e308", "1.7976931348623159e308", "1e1000", "[1e400]", #"{"n":1e400}"#])
+    func numbersBeyondDoubleRangeKeepTheirSpelling(_ text: String) throws {
+        #expect(try JSON.parse(text).description == text)
+        #expect(try JSON.parse(Array(text.utf8)).description == text)
+    }
+
+    static let longNumberDocuments: [String] = [
+        "1.2345678901234567890123e200", "1.2345678901234567890123e-130", "12345678901234567890123e-150",
+        "4.940656458412465442e-324", "1" + String(repeating: "0", count: 166),  // an integer of 167 digits
+        "1" + String(repeating: "0", count: 300), "-1" + String(repeating: "0", count: 200),
+        "[1,1.2345678901234567890123e200]", #"{"n":1.2345678901234567890123e-130}"#,
+    ]
+
+    @Test(arguments: longNumberDocuments)
+    func longNumbersKeepTheirSpelling(_ text: String) throws {
+        #expect(try JSON.parse(text).description == text, "\(text.prefix(40)) (\(text.utf8.count) bytes)")
+        #expect(try JSON.parse(Array(text.utf8)).description == text)
+    }
+
+    @Test func largeAndSmallFiniteDoublesAreAvailable() {
+        #expect(outcome("1.2345678901234567890123e100").value?.doubleValue != nil)
+        #expect(outcome("1.2345678901234567890123e-100").value?.doubleValue != nil)
+        #expect(outcome("1" + String(repeating: "0", count: 165)).value?.doubleValue != nil)  // 166 digits
+        #expect(outcome("1.2345678901234567e200").value?.doubleValue == 1.2345678901234567e200)
+        #expect(outcome("1e300").value?.doubleValue == 1e300)
+    }
+
     @Test func integersInMachineRange() throws {
         #expect(try JSON.parse("0").intValue == 0)
         #expect(try JSON.parse("-0").intValue == 0)
@@ -859,28 +829,28 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         }
     }
 
-    @Test func integersBeyondSixtyFourBitsAreDoubles() throws {
+    @Test func integersBeyondSixtyFourBitsRemainDistinct() throws {
         let twoToThe64 = try JSON.parse("18446744073709551616")
         #expect(twoToThe64.numberValue?.int64Value == nil)
         #expect(twoToThe64.doubleValue == 18446744073709551616.0)
-        #expect(twoToThe64.description == "1.8446744073709552e+19")
+        #expect(twoToThe64.description == "18446744073709551616")
         #expect(twoToThe64.typeName == "integer")
-        #expect(twoToThe64 == .number(JSONNumber(lexeme: "18446744073709552000")!))
-        #expect(twoToThe64 == (try JSON.parse("18446744073709551617")))
-        #expect(twoToThe64.hashValue == (try JSON.parse("18446744073709551617")).hashValue)
+        #expect(twoToThe64 != .number(JSONNumber(lexeme: "18446744073709552000")!))
+        #expect(twoToThe64 != (try JSON.parse("18446744073709551617")))
+        #expect(twoToThe64.doubleValue == (try JSON.parse("18446744073709551617")).doubleValue)
         // UInt64.max fits 64 bits and stays exact: it is not its rounded neighbour.
         let uint64Max = try JSON.parse("18446744073709551615")
         #expect(uint64Max.description == "18446744073709551615")
         #expect(twoToThe64 != uint64Max)
         #expect(uint64Max.numberValue! < twoToThe64.numberValue!)
         let belowInt64 = try JSON.parse("-9223372036854775809")
-        #expect(belowInt64.description == "-9.223372036854776e+18")
-        #expect(belowInt64 == .number(JSONNumber(lexeme: "-9223372036854776000")!))
-        #expect(belowInt64 == (try JSON.parse("-9223372036854775810")))
+        #expect(belowInt64.description == "-9223372036854775809")
+        #expect(belowInt64 != .number(JSONNumber(lexeme: "-9223372036854776000")!))
+        #expect(belowInt64 != (try JSON.parse("-9223372036854775810")))
         #expect(belowInt64 != (try JSON.parse("-9223372036854775808")))
         #expect(belowInt64.numberValue?.int64Value == nil)
         #expect(belowInt64.numberValue! < JSONNumber(Int64.min))
-        #expect(try JSON.parse("123456789012345678901234567890") == JSON.parse("123456789012345678901234567891"))
+        #expect(try JSON.parse("123456789012345678901234567890") != JSON.parse("123456789012345678901234567891"))
         // Far apart they are still different numbers.
         #expect(twoToThe64 != (try JSON.parse("36893488147419103232")))
         #expect(try JSON.parse("1" + String(repeating: "0", count: 30)) != JSON.parse("1" + String(repeating: "0", count: 31)))
@@ -903,15 +873,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(try JSON.parse("3.141592653589793").doubleValue == Double.pi)
     }
 
-    static func looksExact(_ written: String) -> Bool {
-        written.utf8.allSatisfy { ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2D }
-    }
-
-    /// What the rule about numbers is for: a value that is not exactly what was sent must be
-    /// visibly approximate when written back — a Double, with its `.` or `e` — and never a
-    /// different integer that looks exact. (`JSONSerialization` hands back 38 digits of a longer
-    /// integer as if they were all of it; that text must not reach the caller.)
-    static let inexactNumbers: [String] = [
+    static let numbersRequiringExplicitDoubleRounding: [String] = [
         String(repeating: "9", count: 20), String(repeating: "9", count: 38), String(repeating: "9", count: 39),
         String(repeating: "9", count: 40), String(repeating: "9", count: 100),
         "340282366920938463463374607431768211455", "340282366920938463463374607431768211456",  // 2^128 - 1, 2^128
@@ -924,20 +886,17 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         "99999999999999999999999999999999999999.9", "1e19", "1e20", "1.0e18", "100e16", "9223372036854775807e0",
     ]
 
-    @Test(arguments: inexactNumbers)
-    func inexactNumbersNeverLookExact(_ text: String) throws {
+    @Test(arguments: numbersRequiringExplicitDoubleRounding)
+    func longDecimalsKeepTheirSpellingAndConvertToDouble(_ text: String) throws {
         let value = try JSON.parse(text)
-        let written = value.description
-        #expect(!Self.looksExact(written), "\(text) came back as the exact-looking \(written)")
-        // Approximate, but not arbitrary: within a few units of the last place of the nearest Double.
+        #expect(value.description == text)
         let nearest = try #require(Double(text))
-        let found = try #require(value.doubleValue)
-        #expect(abs(found - nearest) <= abs(nearest) * 1e-15, "\(text) came back as \(written), nearest is \(nearest)")
+        #expect(value.doubleValue == nearest)
     }
 
     /// The same property over generated numbers: integers of 1 to 60 digits and the same digits
     /// with a fraction or an exponent attached.
-    @Test func generatedNumbersAreExactOrVisiblyApproximate() throws {
+    @Test func generatedNumbersKeepTheirSpelling() throws {
         var generator = SplitMix64(state: 0xD2)
         var failures = 0
         func record(_ message: String) {
@@ -951,25 +910,17 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
             let suffix = ["", "", "", ".0", ".5", "e0", "E0", "e1", "e-1", ".25e2"][Int.random(in: 0..<10, using: &generator)]
             let text = sign + digits + suffix
             guard let value = try? JSON.parse(text) else {
-                // Long digit strings with an exponent can fall into documented difference 9.
-                if suffix.isEmpty { record("iteration \(iteration): \(text) was rejected") }
+                record("iteration \(iteration): \(text) was rejected")
                 continue
             }
-            let written = value.description
-            let fits = suffix.isEmpty && (Int64(text) != nil || UInt64(text) != nil)
-            if fits {
-                if written != text { record("iteration \(iteration): \(text) fits 64 bits and came back as \(written)") }
-            } else if Self.looksExact(written) {
-                record("iteration \(iteration): \(text) came back as the exact-looking \(written)")
+            if value.description != text {
+                record("iteration \(iteration): \(text) came back as \(value)")
             }
         }
         #expect(failures == 0)
     }
 
-    /// "Becomes a Double" means the nearest Double, which is what the default codec and
-    /// `Double(_:)` give. Foundation hands a number with more than about 17 significant digits
-    /// back as a decimal; its own `doubleValue` is not correctly rounded (`1e30` written out in
-    /// full comes back as 9.999999999999999e+29), so the fallback reads the decimal's text.
+    /// Explicit conversion uses the nearest representable Double.
     @Test(arguments: [
         "0.1000000000000000055511151231257827",  // the exact value of the Double 0.1
         "0.3000000000000000444089209850062616169452667236328125",  // the exact value of 0.1 + 0.2
@@ -983,7 +934,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         "1.7976931348623157e308", "2.2250738585072014e-308",
         "123456789012345678", "1234567890123456789.0", "0.1e1", "1e23", "8.5e22", "9.5e22", "1e22", "4.35", "2.675", "0.57", "8.7",
     ])
-    func longNumbersBecomeTheNearestDouble(_ text: String) throws {
+    func longNumbersConvertToTheNearestDouble(_ text: String) throws {
         let nearest = try #require(Double(text))
         let value = try JSON.parse(text)
         #expect(value.doubleValue == nearest, "\(text) came back as \(value), the nearest Double is \(nearest)")
@@ -1019,8 +970,7 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
     }
 
     /// The same for numbers that are not printed Doubles: random digits, any length, with
-    /// fractions and exponents. Whatever is accepted is the nearest Double, or — for an integer
-    /// that fits 64 bits — exact.
+    /// fractions and exponents. Parsing preserves the spelling and conversion rounds to Double.
     @Test func generatedNumbersAreCorrectlyRounded() throws {
         var generator = SplitMix64(state: 0xD0B1E)
         var failures = 0
@@ -1033,9 +983,9 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
                 for _ in 0..<Int.random(in: 1...40, using: &generator) { text += String(Int.random(in: 0...9, using: &generator)) }
             }
             if Int.random(in: 0..<3, using: &generator) == 0 { text += "e\(Int.random(in: -60...60, using: &generator))" }
-            guard let value = try? JSON.parse(text), let found = value.doubleValue, let nearest = Double(text) else { continue }
-            let exact = Int64(text) != nil || UInt64(text) != nil
-            if exact ? value.description != text : found != nearest {
+            let value = try JSON.parse(text)
+            let nearest = try #require(Double(text))
+            if value.description != text || value.doubleValue != nearest {
                 failures += 1
                 if failures <= 10 { Issue.record("iteration \(iteration): \(text) came back as \(value), the nearest Double is \(nearest)") }
             }
@@ -1043,34 +993,28 @@ private let syntaxError = Refusal(kind: .malformed, offset: 0)
         #expect(failures == 0)
     }
 
-    /// The known limit of reading the decimal's text: Foundation keeps 38 digits and drops the
-    /// rest, so a number that sits just above the midpoint of two Doubles, with the difference
-    /// past the 38th digit, is seen as the midpoint itself and rounds to the even neighbour —
-    /// one unit in the last place away from the right answer. The default codec gets these right.
-    /// Pinned as it is; if Foundation or the fallback changes, this says so.
-    @Test func digitsPastTheThirtyEighthAreNotSeen() throws {
-        let cases: [(text: String, nearest: Double, found: Double)] = [
-            // 2^53 + 1 and a little: the right answer is 2^53 + 2.
-            ("9007199254740993." + String(repeating: "0", count: 30) + "1", 9007199254740994, 9007199254740992),
-            // 1 + 2^-53 and a little: the right answer is the Double after 1.
-            ("1.00000000000000011102230246251565404236316680908203126", 1.0000000000000002, 1.0),
+    /// Digits beyond decimal storage precision can change which Double is nearest.
+    @Test func digitsPastTheThirtyEighthAffectRounding() throws {
+        let cases: [(text: String, nearest: Double)] = [
+            ("9007199254740993." + String(repeating: "0", count: 30) + "1", 9007199254740994),
+            ("1.00000000000000011102230246251565404236316680908203126", 1.0000000000000002),
+            ("9007199254740993." + String(repeating: "0", count: 20) + "1", 9007199254740994),
         ]
-        for (text, nearest, found) in cases {
+        for (text, nearest) in cases {
             #expect(Double(text) == nearest)
             let value = try JSON.parse(text)
-            #expect(value.doubleValue == found, "\(text) came back as \(value)")
-            #expect(abs(found - nearest) == nearest.ulp || abs(found - nearest) == found.ulp)
+            #expect(value.description == text)
+            #expect(value.doubleValue == nearest)
         }
-        // The same digits cut to 38: nothing is lost, and the answer is right.
-        #expect(try JSON.parse("9007199254740993." + String(repeating: "0", count: 20) + "1").doubleValue == 9007199254740994)
     }
 
-    /// Below the Double range the fallback is not even consistent with itself: some underflows
-    /// become zero, larger ones are errors. Pinned as observed; the default codec keeps both.
-    @Test func underflow() throws {
-        #expect(try JSON.parse("1e-400").description == "0.0")
-        #expect(try JSON.parse("2e-324").description == "0.0")
-        #expect(outcome("1e-1000").error == syntaxError)
+    @Test func underflowOccursOnlyWhenConvertingToDouble() throws {
+        for text in ["1e-400", "2e-324", "1e-1000"] {
+            let value = try JSON.parse(text)
+            #expect(value.description == text)
+            #expect(value.doubleValue == 0)
+            #expect(value != 0)
+        }
     }
 
     /// Very long number literals must cost time proportional to their length and no stack.
