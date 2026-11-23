@@ -2,7 +2,7 @@ import { AssertionError } from "node:assert/strict";
 import { linkSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { codecs, requiredChecks, revisions } from "./matrix.mjs";
-import { assertReleaseLoadSummary, releaseLoadProfile, summarizeReleaseLoad } from "./verify-release-load.mjs";
+import { assertReleaseLoadSummary, assertReleaseWireEvidence, releaseLoadProfile, summarizeReleaseLoad } from "./verify-release-load.mjs";
 
 const stages = new Set([
   "preparation", "dependencies", "build_default", "verify_default",
@@ -30,6 +30,7 @@ function checkSummary(record, expected) {
 function passedLoad(load) {
   try {
     assertReleaseLoadSummary(load);
+    assertReleaseWireEvidence(load);
     return true;
   } catch (error) {
     if (error instanceof AssertionError) return false;

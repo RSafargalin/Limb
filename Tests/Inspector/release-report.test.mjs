@@ -46,6 +46,7 @@ function passingRow({ revision }, droppedSlots = 0) {
       toolErrors: 0,
       droppedSlots,
       steps,
+      wire: { matched: requests, startWindowMs: 29_500, p50Ms: 1, p95Ms: 5 },
     },
   };
 }
@@ -313,6 +314,7 @@ test("retains safe numeric evidence for failed sustained load", async (t) => {
   row.load.steps[0].ok -= 2;
   row.load.steps[0].errors = 1;
   row.load.steps[0].toolErrors = 1;
+  delete row.load.wire;
   const expected = structuredClone(row.load);
   row.load.rawLatency = [25, 100];
   row.load.steps[0].logPath = "/private/test/inspector.log";
@@ -324,4 +326,30 @@ test("retains safe numeric evidence for failed sustained load", async (t) => {
   assert.equal(reportedRow.status, "failed");
   assert.deepEqual(reportedRow.checks, checkSummary(row.checks));
   assert.deepEqual(reportedRow.load, expected);
+});
+
+test("requires consistent wire evidence for every passing sustained-load row", async (t) => {
+  const fixture = await session(t);
+  await fixture.writePassingMatrix();
+  const invalidate = [
+    (load) => { delete load.wire; },
+    (load) => { load.wire.matched -= 1; },
+    (load) => { load.wire.startWindowMs = 28_999; },
+    (load) => { load.wire.p50Ms = -1; },
+    (load) => { load.wire.p95Ms = load.wire.p50Ms - 1; },
+  ];
+  for (const [index, change] of invalidate.entries()) {
+    const row = passingRow(cells[index]);
+    change(row.load);
+    await fixture.writeRow(cells[index], row);
+  }
+
+  assertExit(fixture.run(), 1);
+  const report = await fixture.readReport();
+  for (const cell of cells.slice(0, invalidate.length)) {
+    assert.notEqual(rowFor(report, cell).status, "passed");
+  }
+  for (const cell of cells.slice(invalidate.length)) {
+    assert.equal(rowFor(report, cell).status, "passed");
+  }
 });
