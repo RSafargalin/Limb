@@ -94,12 +94,14 @@ struct URITemplate: Sendable {
     }
 
     let parts: [Part]
+    private let literalBytes: Int
 
     /// Templates and URIs are compared as bytes. `String` works in characters, and to it a `/`
     /// followed by a combining mark is not a slash, and two spellings of "é" are one text —
     /// neither is how a URI is read.
     init?(_ template: String) {
         let bytes = Array(template.utf8)
+        guard bytes.count <= Self.maxTemplateBytes else { return nil }
         var parts: [Part] = []
         var names: Set<String> = []
         var literal: [UInt8] = []
@@ -140,29 +142,65 @@ struct URITemplate: Sendable {
         }
         if !literal.isEmpty { parts.append(.literal(literal)) }
         self.parts = parts
+        literalBytes = parts.reduce(0) { count, part in
+            if case .literal(let bytes) = part { return count + bytes.count }
+            return count
+        }
     }
 
     /// The longest URI a template is matched against. Matching keeps a table of
     /// (template parts × URI bytes), and no resource is named by more than this.
     static let maxURIBytes = 64 * 1024
+    static let maxTemplateBytes = 4 * 1024
+    static let matchingWorkLimit = 4_000_000
 
     /// Matches `uri` against the template, returning its variables.
     ///
     /// Each variable takes as much as it can while the rest still matches, as a greedy regular
     /// expression would. The answer is found without trying the alternatives one by one: a table
     /// of "can the rest of the template match from here" is filled from the end, so the time is
-    /// proportional to the URI's length times the template's, whatever the URI. The request path
-    /// runs this on the connection's reader, where a slow refusal would stall everything else.
-    func match(_ uri: String) -> [String: String]? {
-        let bytes = Array(uri.utf8)
+    /// bounded by the caller's shared search budget, including failed candidates. Compatibility
+    /// gives a nonempty split priority. If none exists, variables may bind to an empty string.
+    func match(_ bytes: [UInt8], budget: inout Int) throws(MCPError) -> [String: String]? {
         let count = bytes.count
         guard count <= URITemplate.maxURIBytes else { return nil }
+        func charge(_ work: Int) throws(MCPError) {
+            guard work <= budget else { throw MCPError.overloaded("resource template matching work limit exceeded") }
+            budget -= work
+        }
+        try charge(1 + min(count, literalBytes))
         // Most URIs that do not match differ in the fixed text at either end; say so before
         // building a table for them. A read that misses pays this for every template.
         if case .literal(let text)? = parts.first, !bytes.starts(with: text) { return nil }
         if case .literal(let text)? = parts.last, !(bytes.count >= text.count && bytes.suffix(text.count).elementsEqual(text)) {
             return nil
         }
+        if parts.count == 1, case .literal(let text) = parts[0] { return text.count == count ? [:] : nil }
+        // A template's literals must occur in order. Rule out cheap misses even if the URI
+        // matches the ends, before building the per-variable matching table.
+        var cursor = 0
+        var boundary = count
+        if case .literal(let text)? = parts.first { cursor = text.count }
+        if case .literal(let text)? = parts.last { boundary -= text.count }
+        guard cursor <= boundary else { return nil }
+        for part in parts.dropFirst().dropLast() {
+            guard case .literal(let text) = part, let marker = text.first else { continue }
+            let lastStart = boundary - text.count
+            guard cursor <= lastStart else { return nil }
+            try charge((lastStart - cursor + 1) * text.count)
+            var found = false
+            while cursor <= lastStart, let offset = bytes[cursor...lastStart].firstIndex(of: marker) {
+                cursor = offset + text.count
+                if bytes[offset..<cursor].elementsEqual(text) {
+                    found = true
+                    break
+                }
+                cursor = offset + 1
+            }
+            guard found else { return nil }
+        }
+        let work = (count + 1) * (1 + parts.count * 3 + literalBytes)
+        try charge(work)
 
         // Where a variable that may not contain "/" has to stop.
         var nextSlash = [Int](repeating: count, count: count + 1)
@@ -173,39 +211,40 @@ struct URITemplate: Sendable {
         func isBoundary(_ position: Int) -> Bool { position == count || bytes[position] & 0xC0 != 0x80 }
 
         // rest[i][p]: parts i… match the bytes from p to the end.
-        var rest = [[Bool]](repeating: [], count: parts.count + 1)
-        var row = [Bool](repeating: false, count: count + 1)
-        row[count] = true
-        rest[parts.count] = row
-        for index in stride(from: parts.count - 1, through: 0, by: -1) {
-            let after = rest[index + 1]
-            row = [Bool](repeating: false, count: count + 1)
-            switch parts[index] {
-            case .literal(let text):
-                if text.count <= count {
-                    for position in 0...(count - text.count) where after[position + text.count] {
-                        var equal = true
-                        for offset in 0..<text.count where bytes[position + offset] != text[offset] {
-                            equal = false
-                            break
+        func table(minimum: Int) -> [[Bool]] {
+            var rest = [[Bool]](repeating: [], count: parts.count + 1)
+            var row = [Bool](repeating: false, count: count + 1)
+            row[count] = true
+            rest[parts.count] = row
+            for index in parts.indices.reversed() {
+                let after = rest[index + 1]
+                row = [Bool](repeating: false, count: count + 1)
+                switch parts[index] {
+                case .literal(let text):
+                    if text.count <= count {
+                        for position in 0...(count - text.count) where after[position + text.count] {
+                            row[position] = bytes[position..<(position + text.count)].elementsEqual(text)
                         }
-                        row[position] = equal
+                    }
+                case .variable(_, let reserved):
+                    var lastEnd = [Int](repeating: -1, count: count + 1)
+                    var latest = -1
+                    for position in 0...count {
+                        if after[position], isBoundary(position) { latest = position }
+                        lastEnd[position] = latest
+                    }
+                    for position in 0...count where isBoundary(position) {
+                        row[position] = lastEnd[reserved ? count : nextSlash[position]] >= position + minimum
                     }
                 }
-            case .variable(_, let reserved):
-                // The last place at or before each position where the value could end.
-                var lastEnd = [Int](repeating: -1, count: count + 1)
-                var latest = -1
-                for position in 0...count {
-                    if after[position], isBoundary(position) { latest = position }
-                    lastEnd[position] = latest
-                }
-                for position in 0..<count {
-                    // A value is never empty: it has to end after it starts.
-                    row[position] = lastEnd[reserved ? count : nextSlash[position]] > position
-                }
+                rest[index] = row
             }
-            rest[index] = row
+            return rest
+        }
+        var rest = table(minimum: 1)
+        if !rest[0][0] {
+            try charge(work)
+            rest = table(minimum: 0)
         }
         guard rest[0][0] else { return nil }
 

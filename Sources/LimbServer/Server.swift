@@ -27,6 +27,7 @@ public final class Server: Sendable {
     let serverInfoMember: [UInt8]
 
     public init(configuration: ServerConfiguration) {
+        let configuration = configuration.normalized()
         self.configuration = configuration
         sealer = configuration.requestStateSealer ?? AEADRequestStateSealer.ephemeral()
         registry = Mutex(RegistrySnapshot())
@@ -163,9 +164,12 @@ public final class Server: Sendable {
 
     /// Registers a family of resources addressed by a URI template such as `file:///{path}`.
     ///
-    /// Limb takes the subset of RFC 6570 resource templates use: `{name}` and `{+name}`, with
-    /// dotted names (`{user.id}`). A template that names the same variable twice is refused,
-    /// although RFC 6570 allows it: a match would have two values for one name.
+    /// Limb supports `{name}` and `{+name}`, with dotted names (`{user.id}`). Repeated variables
+    /// and templates over 4 KiB are refused. Reverse matching prefers the longest nonempty
+    /// captures and falls back to empty captures when necessary. A simple variable cannot
+    /// consume a raw slash. Both operators decode percent-encoded values. Matching URIs up to
+    /// 64 KiB uses a shared budget of four million byte comparisons and matching-table steps
+    /// for all candidates in a single request.
     public func register(
         resourceTemplate definition: ResourceTemplateDefinition, cache: CachePolicy? = nil,
         complete: CompletionHandler? = nil, read: @escaping ResourceReader
@@ -431,11 +435,13 @@ public final class Server: Sendable {
             } else {
                 // The owner's own queue counts by the answer just given, not by a second one.
                 for (other, queue) in gate.queues where other == owner || !queue.peerIsBehind() {
+                    guard queue.count <= budgets.maxQueuedRequests - count,
+                        queue.bytes <= budgets.maxQueuedBytes - bytes else { return .overloaded }
                     count += queue.count
                     bytes += queue.bytes
                 }
             }
-            guard count < budgets.maxQueuedRequests, bytes + entry.bytes <= budgets.maxQueuedBytes else {
+            guard count < budgets.maxQueuedRequests, entry.bytes <= budgets.maxQueuedBytes - bytes else {
                 return .overloaded
             }
             gate.queues[owner, default: OwnerQueue(peerIsBehind: entry.peerIsBehind)].append(entry, sequence: gate.nextSequence)

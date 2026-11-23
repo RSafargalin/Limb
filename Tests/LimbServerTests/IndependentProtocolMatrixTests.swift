@@ -384,11 +384,14 @@ private extension JSONValue {
     @Test(arguments: IndependentProtocolRevision.allCases)
     func resourceNotFoundCode(_ revision: IndependentProtocolRevision) async throws {
         let client = try await IndependentProtocol.client(try IndependentProtocolRich.server(), revision)
-        for uri in ["rich://missing", "rich://items/", "rich://items/a/b", "", "RICH://static", "rich://static/"] {
+        for uri in ["rich://missing", "rich://items/a/b", "", "RICH://static", "rich://static/"] {
             let response = try await client.request("resources/read", ["uri": .string(uri)])
             #expect(response.code == (revision.isModern ? -32602 : -32002), "\(revision.rawValue) \(uri): \(response)")
             #expect(response["result"] == nil)
         }
+        let emptyVariable = try await client.request("resources/read", ["uri": "rich://items/"])
+        #expect(emptyVariable.code == nil)
+        #expect(emptyVariable["result"]?["contents"]?[0]?["text"] == #"{"id":""}"#)
     }
 
     /// "Clarify that input validation errors should be returned as Tool Execution Errors rather

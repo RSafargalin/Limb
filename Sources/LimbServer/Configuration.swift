@@ -1,12 +1,14 @@
 public import LimbCore
 
 /// Resource budgets. They are on by default: overload must produce a clear error, not unbounded
-/// memory or an endless wait.
+/// memory or an endless wait. A server stores an effective copy of these limits. Negative
+/// limits become zero, and `maxConcurrentHandlers` always allows at least one handler.
 public struct ServerBudgets: Sendable {
     /// Handlers running at once; further requests wait in the admission queue.
     public var maxConcurrentHandlers: Int
-    /// Requests waiting for a handler slot, by count and by total frame bytes. A connection whose
-    /// peer is behind on reading has the same limits to itself, apart from everyone else.
+    /// Requests waiting for a handler slot, by count and bytes. Single frames cost their received
+    /// length. Batch members cost their individual compact JSON encoding. A connection whose
+    /// peer is behind on reading has these limits to itself, apart from everyone else.
     public var maxQueuedRequests: Int
     public var maxQueuedBytes: Int
     /// Largest incoming frame.
@@ -66,6 +68,21 @@ public struct ServerBudgets: Sendable {
     public static let network = ServerBudgets(
         maxConcurrentHandlers: 64, maxQueuedRequests: 256, maxQueuedBytes: 128 << 20, maxFrameBytes: 4 << 20,
         maxResponseBytes: 16 << 20, maxBatchItems: 32, maxOutboundBytes: 32 << 20, maxSubscriptions: 16)
+
+    mutating func normalize() {
+        maxConcurrentHandlers = max(1, maxConcurrentHandlers)
+        maxQueuedRequests = max(0, maxQueuedRequests)
+        maxQueuedBytes = max(0, maxQueuedBytes)
+        maxFrameBytes = max(0, maxFrameBytes)
+        maxResponseBytes = max(0, maxResponseBytes)
+        maxBatchItems = max(0, maxBatchItems)
+        maxOutboundBytes = max(0, maxOutboundBytes)
+        maxSubscriptions = max(0, maxSubscriptions)
+        maxSubscribedResources = max(0, maxSubscribedResources)
+        maxSubscribedResourceBytes = max(0, maxSubscribedResourceBytes)
+        maxInputResponses = max(0, maxInputResponses)
+        maxRequestIDBytes = max(0, maxRequestIDBytes)
+    }
 }
 
 /// How handlers are scheduled.
@@ -112,19 +129,22 @@ public struct ServerConfiguration: Sendable {
     public var listCache = CachePolicy(ttlMilliseconds: 0, scope: .public)
     /// Default cache hints for `resources/read`; a resource can override them.
     public var resourceCache = CachePolicy(ttlMilliseconds: 0, scope: .private)
-    /// Items per page of a list result; `nil` returns everything in one page.
+    /// Items per page of a list result. `nil` returns everything in one page, and a server
+    /// treats a supplied value below one as one.
     public var pageSize: Int?
     public var parseOptions = JSONParseOptions()
     /// In-memory tool schema documents keyed by absolute URI. Unresolved references fail
     /// registration. URI resolution performs no I/O.
     public var schemaResources: [String: JSONValue] = [:]
-    /// How long `requestState` stays valid. Elicitation waits for a person, hence minutes.
-    public var requestStateLifetimeSeconds = 900
     /// Maximum nesting of JSON objects and arrays in a typed tool result.
     /// Zero permits scalars, and values above `JSONParseOptions.depthCeiling` use that ceiling.
     public var maxToolOutputDepth = 128
+    /// How long `requestState` stays valid. A server treats negative values as zero.
+    /// Elicitation waits for a person, hence minutes.
+    public var requestStateLifetimeSeconds = 900
     /// The most a `requestState` may hold before sealing. Answers from earlier rounds travel in
     /// it, so this bounds what one request can make the client carry back and forth.
+    /// A server treats negative values as zero.
     public var maxRequestStateBytes = 1 << 20
     /// Protects `requestState`. `nil` uses a random key that lives as long as the process, which
     /// is right for stdio; a server behind a load balancer must supply a shared key.
@@ -155,9 +175,20 @@ public struct ServerConfiguration: Sendable {
     /// sent reaches it escaped and shortened, and a connection reports each kind of peer
     /// misbehaviour a limited number of times.
     public var diagnostics: @Sendable (String) -> Void = ServerConfiguration.standardErrorDiagnostics
+    package var beforeAdmission: (@Sendable (RequestID) -> Void)?
 
     public init(info: Implementation) {
         self.info = info
+    }
+
+    func normalized() -> Self {
+        var configuration = self
+        configuration.budgets.normalize()
+        configuration.pageSize = pageSize.map { max(1, $0) }
+        configuration.maxRequestStateBytes = max(0, maxRequestStateBytes)
+        configuration.requestStateLifetimeSeconds = max(0, requestStateLifetimeSeconds)
+        configuration.maxToolOutputDepth = min(max(0, maxToolOutputDepth), JSONParseOptions.depthCeiling)
+        return configuration
     }
 
     var handlerLimit: Int { execution == .serial ? 1 : max(1, budgets.maxConcurrentHandlers) }

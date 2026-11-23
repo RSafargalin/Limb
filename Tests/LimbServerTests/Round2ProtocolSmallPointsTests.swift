@@ -635,9 +635,8 @@ struct Round2ProtocolSmallPointsTests {
         #expect(try await read("p://a/b") == nil)
         #expect(try await read("r://a/b/c") == ["rest": "a/b/c"])
         #expect(try await read("s://preXpost") == ["v": "X"])
-        // An empty expansion is a valid RFC 6570 expansion; Limb does not match it.
-        #expect(try await read("p://") == nil)
-        #expect(try await read("s://prepost") == nil)
+        #expect(try await read("p://") == ["v": ""])
+        #expect(try await read("s://prepost") == ["v": ""])
     }
 
     // MARK: Registry mutation from a deinit

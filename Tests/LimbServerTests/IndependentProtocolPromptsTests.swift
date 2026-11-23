@@ -182,9 +182,8 @@ private extension JSONValue {
             #""ref":{"type":5,"name":"rich_prompt"},\#(argument)"#,
             #""ref":{"type":"ref/prompt"},\#(argument)"#, #""ref":{"type":"ref/prompt","name":"no_such_prompt"},\#(argument)"#,
             #""ref":{"type":"ref/prompt","name":5},\#(argument)"#, #""ref":{"type":"ref/prompt","uri":"rich://items/{id}"},\#(argument)"#,
-            #""ref":{"type":"ref/resource"},\#(argument)"#, #""ref":{"type":"ref/resource","uri":"nope://{x}"},\#(argument)"#,
+            #""ref":{"type":"ref/resource"},\#(argument)"#,
             #""ref":{"type":"ref/resource","uri":5},\#(argument)"#, #""ref":{"type":"ref/resource","name":"rich_prompt"},\#(argument)"#,
-            #""ref":{"type":"ref/resource","uri":"rich://static"},\#(argument)"#,
             #"\#(prompt),"argument":null"#, #"\#(prompt),"argument":"topic""#, #"\#(prompt),"argument":["topic","s"]"#, #"\#(prompt),"argument":{}"#,
             #"\#(prompt),"argument":{"name":"topic"}"#, #"\#(prompt),"argument":{"value":"s"}"#, #"\#(prompt),"argument":{"name":5,"value":"s"}"#,
             #"\#(prompt),"argument":{"name":"topic","value":5}"#, #"\#(prompt),"argument":{"name":"topic","value":null}"#,
@@ -193,6 +192,13 @@ private extension JSONValue {
             let params = [meta, body].filter { !$0.isEmpty }.joined(separator: ",")
             let reply = try await IndependentProtocol.reply(client, #"{"jsonrpc":"2.0","id":9,"method":"completion/complete","params":{\#(params)}}"#)
             #expect(reply.code == -32602, "\(revision.rawValue) {\(body)}: \(reply)")
+        }
+        for uri in ["nope://{x}", "rich://static"] {
+            let reply = try await client.request("completion/complete", [
+                "ref": ["type": "ref/resource", "uri": .string(uri)],
+                "argument": ["name": "topic", "value": "s"],
+            ])
+            #expect(reply.code == -32602, "\(revision.rawValue) \(uri): \(reply)")
         }
     }
 

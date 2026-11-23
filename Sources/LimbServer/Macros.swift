@@ -62,8 +62,7 @@ public enum ToolSupport {
     public static func result(_ value: [ContentBlock], context: RequestContext) throws -> ToolResult { result(value) }
     public static func result(_ value: ContentBlock, context: RequestContext) throws -> ToolResult { result(value) }
     public static func result<T: SchemaRepresentable>(_ value: T, context: RequestContext) throws -> ToolResult {
-        let configuredLimit = context.connection.server.configuration.maxToolOutputDepth
-        let limit = min(max(0, configuredLimit), JSONParseOptions.depthCeiling)
+        let limit = context.connection.server.configuration.maxToolOutputDepth
         do {
             return .structured(try value.jsonValue(maxDepth: limit))
         } catch {
