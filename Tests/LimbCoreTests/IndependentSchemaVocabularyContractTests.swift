@@ -178,6 +178,29 @@ import Testing
         #expect(throws: JSONSchemaError.self) { try JSONSchema(schema, registeredSchemas: [:]) }
     }
 
+    @Test func registeredMetaSchemaResolvesByRetrievalURIAndCanonicalID() throws {
+        let retrieval = "https://registry.example.test/dialects/core-validation"
+        let canonical = "https://schemas.example.test/dialects/core-validation"
+        let registry: [String: JSONValue] = [retrieval: [
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": .string(canonical),
+            "$vocabulary": [
+                "https://json-schema.org/draft/2020-12/vocab/core": true,
+                "https://json-schema.org/draft/2020-12/vocab/validation": true,
+            ],
+            "type": ["object", "boolean"],
+        ]]
+        for uri in [retrieval, canonical] {
+            let document: JSONValue = ["$schema": .string(uri), "type": "integer", "minimum": 2]
+            let compiled = try JSONSchema(document, registeredSchemas: registry)
+            #expect(compiled.validate(2) == nil)
+            #expect(compiled.validate(1) != nil)
+            #expect(compiled.validate("2") != nil)
+        }
+        let unknown: JSONValue = ["$schema": "https://registry.example.test/dialects/missing", "type": "integer", "minimum": 2]
+        #expect(throws: JSONSchemaError.self) { try JSONSchema(unknown, registeredSchemas: registry) }
+    }
+
     @Test
     func registeredMetaSchemaSelectsTheVocabulariesInUse() throws {
         // Core §§ 8.1.1–2 and 10.3.2.1.
@@ -201,6 +224,53 @@ import Testing
         #expect(schema.validate(["quantity": 2]) == nil)
         #expect(schema.validate(["quantity": 8]) == nil)
         #expect(schema.validate(["blocked": true, "quantity": 8]) != nil)
+    }
+
+    @Test func embeddedResourceChecksAnnotationsUsingItsOwnDialect() throws {
+        let current: JSONValue = "https://json-schema.org/draft/2020-12/schema"
+        let legacy: JSONValue = "http://json-schema.org/draft-07/schema#"
+        func document(outer: JSONValue, embedded: JSONValue, deprecated: JSONValue) -> JSONValue {
+            [
+                "$schema": outer,
+                "type": "object",
+                "properties": ["value": [
+                    "$id": "https://example.test/leaf",
+                    "$schema": embedded,
+                    "type": "string",
+                    "deprecated": deprecated,
+                ]],
+            ]
+        }
+        let draft7 = try JSONSchema(document(outer: current, embedded: legacy, deprecated: "legacy"))
+        #expect(draft7.validate(["value": "oak"]) == nil)
+        #expect(draft7.validate(["value": 2]) != nil)
+
+        let currentResource = try JSONSchema(document(outer: legacy, embedded: current, deprecated: true))
+        #expect(currentResource.validate(["value": "oak"]) == nil)
+        #expect(throws: JSONSchemaError.self) {
+            try JSONSchema(document(outer: legacy, embedded: current, deprecated: "legacy"))
+        }
+    }
+
+    @Test func optionalVocabularyStillNeedsAnAbsoluteURI() throws {
+        let uri = "https://example.test/project-meta"
+        func registry(_ optionalVocabulary: String) -> [String: JSONValue] {
+            let vocabularies: JSONObject = [
+                "https://json-schema.org/draft/2020-12/vocab/core": true,
+                optionalVocabulary: false,
+            ]
+            return [uri: [
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": .string(uri),
+                "$vocabulary": .object(vocabularies),
+            ]]
+        }
+        let schema: JSONValue = ["$schema": .string(uri)]
+        let compiled = try JSONSchema(schema, registeredSchemas: registry("https://example.test/vocabulary"))
+        #expect(compiled.validate("oak") == nil)
+        #expect(throws: JSONSchemaError.self) {
+            try JSONSchema(schema, registeredSchemas: registry("relative/vocabulary"))
+        }
     }
 
     @Test(arguments: [false, true])

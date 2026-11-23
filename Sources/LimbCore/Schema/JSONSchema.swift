@@ -117,6 +117,8 @@ public struct JSONSchema: Sendable {
     }
 
     /// Compiles against schema documents supplied in memory at absolute retrieval URIs.
+    /// A registered 2020-12 meta-schema selects vocabularies by retrieval URI or by its
+    /// root `$id`. Its own constraints on schema documents can be evaluated separately.
     public init(
         _ schema: JSONValue, registeredSchemas: [String: JSONValue], limits: Limits = Limits()
     ) throws(JSONSchemaError) {
@@ -457,6 +459,7 @@ private struct Compiler {
     var byPointer: [ExactString: Int] = [:]
     private var locations: [ExactString: Location] = [:]
     private var resources: [ExactString: String] = [:]
+    private var registeredDialects: [ExactString: Dialect] = [:]
     private var anchors: [ExactString: [ExactString: Anchor]] = [:]
     private var neededResources: Set<ExactString> = []
 
@@ -520,11 +523,16 @@ private struct Compiler {
 
     private func dialect(at uri: String) -> Dialect? {
         if JSONSchema.supportedDialects.contains(uri) { return Dialect(isDraft7: uri.contains("draft-07")) }
-        guard let meta = registeredSchemas[uri], meta["$schema"] == "https://json-schema.org/draft/2020-12/schema",
+        return registeredDialects[ExactString(uri)]
+    }
+
+    private static func registeredDialect(in meta: JSONValue) -> Dialect? {
+        guard meta["$schema"] == "https://json-schema.org/draft/2020-12/schema",
             let declaration = meta["$vocabulary"]?.objectValue else { return nil }
         var active: Set<Vocabulary> = [.core]
         for (name, requirement) in declaration {
-            guard let required = requirement.boolValue else { return nil }
+            guard let uri = URL(string: name, encodingInvalidCharacters: false), uri.scheme != nil,
+                let required = requirement.boolValue else { return nil }
             if name.hasPrefix(Self.vocabularyBase), let known = Vocabulary(rawValue: String(name.dropFirst(Self.vocabularyBase.count))) {
                 active.insert(known)
             } else if required {
@@ -543,6 +551,13 @@ private struct Compiler {
         for (index, entry) in registeredSchemas.sorted(by: { $0.key < $1.key }).enumerated() {
             guard let base = URL(string: entry.key, encodingInvalidCharacters: false), base.scheme != nil, base.fragment == nil else {
                 throw JSONSchemaError(reason: "registered schema URI must be absolute and fragment-free", pointer: "")
+            }
+            if let dialect = Self.registeredDialect(in: entry.value) {
+                registeredDialects[ExactString(base.absoluteString)] = dialect
+                if let id = entry.value["$id"]?.stringValue, let canonical = uriReference(id, against: base),
+                    canonical.fragment?.isEmpty != false {
+                    registeredDialects[ExactString(canonical.base.absoluteString)] = dialect
+                }
             }
             pending.append((entry.value, "registered:\(index)", base, defaultDialect, 0))
         }
@@ -701,7 +716,7 @@ private struct Compiler {
         }
 
         func sub(_ key: String) -> String { "\(pointer)/\(escape(key))" }
-        try validateAnnotations(object, at: pointer)
+        try validateAnnotations(object, at: pointer, isDraft7: isDraft7)
 
         // Definitions are checked whether or not anything refers to them: a malformed one is a
         // mistake even while unused. Each costs a node toward `maxSubschemas`.
@@ -984,7 +999,7 @@ private struct Compiler {
         return result
     }
 
-    private func validateAnnotations(_ object: JSONObject, at pointer: String) throws(JSONSchemaError) {
+    private func validateAnnotations(_ object: JSONObject, at pointer: String, isDraft7: Bool) throws(JSONSchemaError) {
         for key in ["title", "description", "$comment", "format", "contentEncoding", "contentMediaType"] {
             if let value = object[key], value.stringValue == nil {
                 throw JSONSchemaError(reason: "\"\(key)\" must be a string", pointer: "\(pointer)/\(key)")
