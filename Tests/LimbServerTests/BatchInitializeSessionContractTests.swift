@@ -8,7 +8,7 @@ struct BatchInitializeSessionContractTests {
     private let instructions = String(repeating: "i", count: 700)
 
     @Test
-    func overloadedBatchInitializePreservesLegacySession() throws {
+    func overloadedStandaloneInitializePreservesLegacySession() throws {
         let server = try makeServer()
         let queue = OutboundQueue(budgetBytes: 256, urgentReserveBytes: 512)
         let connection = server.connect(to: queue)
@@ -22,7 +22,7 @@ struct BatchInitializeSessionContractTests {
     }
 
     @Test
-    func overloadedBatchInitializePreservesNegotiatedCapabilities() async throws {
+    func overloadedStandaloneInitializePreservesNegotiatedCapabilities() async throws {
         let server = try makeServer()
         try server.register(tool: ToolDefinition(name: "has-roots")) { _, context in
             .text(context.clientCapabilities.supportsRoots ? "true" : "false")
@@ -48,7 +48,7 @@ struct BatchInitializeSessionContractTests {
     }
 
     @Test
-    func oversizedBatchResponsePreservesLegacySession() throws {
+    func batchRejectsInitializeWithinResponseSizeLimit() throws {
         let calibrationServer = try makeServer()
         let legacyQueue = OutboundQueue(budgetBytes: 4_096)
         let laterQueue = OutboundQueue(budgetBytes: 4_096)
@@ -70,7 +70,7 @@ struct BatchInitializeSessionContractTests {
         connection.receive(batch.encoded())
 
         let replies = try indexedReplies(takeReply(queue), ids: [2, 3, 4])
-        #expect(replies[2]?["error"]?["code"]?.intValue == -31002)
+        #expect(replies[2]?["error"]?["code"]?.intValue == -32600)
         #expect(replies[3]?["result"] != nil)
         #expect(replies[4]?["result"] != nil)
         #expect(!connection.hasOverflowed)
@@ -80,7 +80,7 @@ struct BatchInitializeSessionContractTests {
     }
 
     @Test
-    func successfulBatchInitializeSelectsNewVersionForLaterFrames() throws {
+    func onlyStandaloneInitializeSelectsNewVersionForLaterFrames() throws {
         let server = try makeServer()
         let queue = OutboundQueue(budgetBytes: 4_096)
         let connection = server.connect(to: queue)
@@ -89,8 +89,11 @@ struct BatchInitializeSessionContractTests {
         let initializeBatch: JSONValue = [initialize(id: 2, version: laterVersion), ping(id: 3)]
         connection.receive(initializeBatch.encoded())
         let replies = try indexedReplies(takeReply(queue), ids: [2, 3])
-        #expect(replies[2]?["result"]?["protocolVersion"]?.stringValue == laterVersion)
+        #expect(replies[2]?["error"]?["code"]?.intValue == -32600)
         #expect(replies[3]?["result"] != nil)
+
+        try expectLegacyBatchAccepted(connection, queue: queue)
+        try establishSession(connection, queue: queue, version: laterVersion)
 
         let laterBatch: JSONValue = [ping(id: 4), ping(id: 5)]
         connection.receive(laterBatch.encoded())
@@ -105,7 +108,7 @@ struct BatchInitializeSessionContractTests {
     }
 
     @Test
-    func batchInitializeChangesVersionAfterAsyncSiblingReplies() async throws {
+    func rejectedBatchInitializePreservesVersionAfterAsyncSiblingReplies() async throws {
         let server = try makeServer()
         let gate = ToolGate()
         defer { Task { await gate.open() } }
@@ -126,17 +129,17 @@ struct BatchInitializeSessionContractTests {
 
         await gate.open()
         let joined = try indexedReplies(await waitForReply(queue), ids: [2, 3])
-        #expect(joined[2]?["result"]?["protocolVersion"]?.stringValue == laterVersion)
+        #expect(joined[2]?["error"]?["code"]?.intValue == -32600)
         #expect(joined[3]?["result"]?["content"]?.arrayValue?.first?["text"]?.stringValue == "ok")
 
         connection.receive(probe.encoded())
-        let afterJoin = try await waitForReply(queue)
-        #expect(afterJoin["id"]?.isNull == true)
-        #expect(afterJoin["error"]?["code"]?.intValue == -32600)
+        let afterJoin = try indexedReplies(await waitForReply(queue), ids: [7, 8])
+        #expect(afterJoin[7]?["result"] != nil)
+        #expect(afterJoin[8]?["result"] != nil)
     }
 
     @Test
-    func batchInitializeChangesVersionAfterAsyncSiblingIsCancelled() async throws {
+    func rejectedBatchInitializePreservesVersionAfterAsyncSiblingIsCancelled() async throws {
         let server = try makeServer()
         let gate = ToolGate()
         defer { Task { await gate.open() } }
@@ -158,13 +161,9 @@ struct BatchInitializeSessionContractTests {
         connection.receive(cancel.encoded())
 
         let joined = try indexedReplies(await waitForReply(queue), ids: [2])
-        #expect(joined[2]?["result"]?["protocolVersion"]?.stringValue == laterVersion)
+        #expect(joined[2]?["error"]?["code"]?.intValue == -32600)
 
-        let probe: JSONValue = [ping(id: 4), ping(id: 5)]
-        connection.receive(probe.encoded())
-        let afterJoin = try await waitForReply(queue)
-        #expect(afterJoin["id"]?.isNull == true)
-        #expect(afterJoin["error"]?["code"]?.intValue == -32600)
+        try expectLegacyBatchAccepted(connection, queue: queue)
     }
 
     private func expectOverloadedInitialize(_ connection: Connection, queue: OutboundQueue) throws {
@@ -177,14 +176,14 @@ struct BatchInitializeSessionContractTests {
         try #require(queue.enqueue(outstandingFrame))
         try #require(queue.isOverBudget)
 
-        let batch: JSONValue = [initialize(id: 2, version: laterVersion), ping(id: 3)]
-        connection.receive(batch.encoded())
+        connection.receive(initialize(id: 2, version: laterVersion).encoded())
 
         let replyFrames = drain(queue).filter { $0 != outstandingFrame }
         try #require(replyFrames.count == 1)
         let wireReply = try #require(replyFrames.first)
-        let replies = try indexedReplies(JSON.parse(wireReply), ids: [2, 3])
-        #expect(replies[2]?["error"]?["code"]?.intValue == -31001)
+        let reply = try JSON.parse(wireReply)
+        #expect(reply["id"]?.intValue == 2)
+        #expect(reply["error"]?["code"]?.intValue == -31001)
         #expect(!connection.hasOverflowed)
     }
 

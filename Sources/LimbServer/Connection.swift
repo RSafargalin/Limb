@@ -45,6 +45,7 @@ public final class Connection: Sendable {
     // MARK: State
 
     private struct LegacySession: Sendable {
+        let identity = LegacySessionIdentity()
         var profile: RevisionProfile
         var capabilities: ClientCapabilities
         var clientInfo: Implementation
@@ -227,7 +228,9 @@ public final class Connection: Sendable {
                 if let id = error.id { _ = failClientRequest(id, .internalError("the peer sent a malformed response")) }
                 report(.malformedReply, "ignored a malformed reply: \(error.error.message)")
                 respondWithNothing(responder)
-            } else if let id = error.id, failClientRequest(id, .internalError("the peer sent a malformed response")) {
+            } else if error.isAmbiguous, let id = error.id,
+                failClientRequest(id, .internalError("the peer sent a malformed response"))
+            {
                 // The id names a request this side sent, so the message is a reply to it, however
                 // broken. Answering it would put a stray response under one of the peer's own ids.
                 report(.malformedReply, "ignored a malformed reply to request \(peerText(id.description)): \(error.error.message)")
@@ -293,7 +296,7 @@ public final class Connection: Sendable {
         if let legacy = state.withLock({ $0.legacy }) {
             return Peer(
                 profile: legacy.profile, capabilities: legacy.capabilities, clientInfo: legacy.clientInfo,
-                logLevel: nil, negotiatedServerCapabilities: legacy.negotiated)
+                logLevel: nil, negotiatedServerCapabilities: legacy.negotiated, legacySession: legacy.identity)
         }
         if method == "ping", let version = configuration.legacyVersions.max(),
             let profile = RevisionProfile.profile(for: version)
@@ -403,6 +406,10 @@ public final class Connection: Sendable {
             return
         }
         if method == "initialize" {
+            if case .batch = responder {
+                respond(Frame.error(id: id, .invalidRequest("initialize must be sent on its own")), id: id, responder)
+                return
+            }
             initialize(id: id, params: params, responder: responder)
             return
         }
@@ -1063,7 +1070,8 @@ public final class Connection: Sendable {
     /// A request the client leaves unanswered for `clientRequestTimeoutSeconds` is withdrawn,
     /// as the specification recommends, and the call throws `MCPError.requestTimedOut`.
     func requestClient(
-        _ request: InputRequest, profile: RevisionProfile, caller: (id: RequestID, serial: UInt64)
+        _ request: InputRequest, profile: RevisionProfile, legacySession: LegacySessionIdentity?,
+        caller: (id: RequestID, serial: UInt64)
     ) async throws -> JSONValue {
         let number = state.withLock { state in
             defer { state.nextClientRequest += 1 }
@@ -1090,8 +1098,16 @@ public final class Connection: Sendable {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
+                    guard state.legacy?.identity === legacySession, state.legacy?.initialized == true else {
+                        continuation.resume(throwing: MCPError.invalidRequest("the legacy client session is not ready"))
+                        return
+                    }
                     state.clientRequests[number] = ClientRequest(continuation: continuation, callerSerial: caller.serial)
-                    sink.enqueue(frame)
+                    guard sink.enqueue(frame) else {
+                        state.clientRequests[number] = nil
+                        continuation.resume(throwing: MCPError.requestDeliveryFailed(method: request.method))
+                        return
+                    }
                     guard let limit else { return }
                     timeout.withLock { timer in
                         timer = Task { [self] in

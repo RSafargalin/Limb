@@ -1,4 +1,5 @@
 public import LimbCore
+import Foundation
 import Synchronization
 
 /// Everything a handler knows about the request it is serving, and its way to talk back
@@ -21,6 +22,7 @@ public final class RequestContext: Sendable {
     let serial: UInt64
     let progressToken: JSONValue?
     let logLevel: LoggingLevel?
+    let legacySession: LegacySessionIdentity?
     let inputState: InputState
 
     init(
@@ -36,6 +38,7 @@ public final class RequestContext: Sendable {
         self.connection = connection
         self.serial = serial
         logLevel = peer.logLevel
+        legacySession = peer.legacySession
         self.inputState = inputState
         // A progress token is a string or an integer; anything else is ignored.
         switch meta[MetaKey.progressToken] {
@@ -114,6 +117,7 @@ public final class RequestContext: Sendable {
         guard inputState.allowed else {
             throw MCPError.internalError("\(method) cannot request additional input")
         }
+        let formValidators = try elicitationValidators(for: requests)
         let keys = requests.map(\.key)
         try inputState.reserve(keys)
         for (_, request) in requests {
@@ -129,7 +133,9 @@ public final class RequestContext: Sendable {
         }
         if profile.multiRoundTrip {
             do {
-                return try inputState.resolve(requests)
+                return try inputState.resolve(requests) { key, answer throws(MCPError) in
+                    try validateFormAnswer(answer, for: key, using: formValidators[key])
+                }
             } catch let signal as InputRequiredSignal {
                 // The run ends here. Throwing cannot force that — the handler may catch the
                 // error — so the handler's task is cancelled as well, and from now on nothing
@@ -140,15 +146,18 @@ public final class RequestContext: Sendable {
         }
         return try await withThrowingTaskGroup(of: (String, InputResponse).self) { group in
             for (key, request) in requests {
-                group.addTask { [connection, profile, requestID, serial, inputState] in
+                group.addTask { [self] in
                     do {
                         let reply = try await connection.requestClient(
-                            request, profile: profile, caller: (id: requestID, serial: serial))
+                            request, profile: profile, legacySession: legacySession, caller: (id: requestID, serial: serial))
+                        let answer: InputResponse
                         do {
-                            return (key, try InputResponse(json: reply, for: request))
+                            answer = try InputResponse(json: reply, for: request)
                         } catch {
                             throw MCPError.internalError("the client's reply to \(request.method) is malformed: \(error)")
                         }
+                        try validateFormAnswer(answer, for: key, using: formValidators[key])
+                        return (key, answer)
                     } catch {
                         // No answer: the question may be asked again.
                         inputState.release([key])
@@ -167,19 +176,8 @@ public final class RequestContext: Sendable {
     /// The content of an accepted answer comes from the client; it is checked against `schema`
     /// before it is returned, and an answer that does not match is an error, never data.
     public func elicit(_ key: String, message: String, schema: JSONObject) async throws -> ElicitResult {
-        let validator: JSONSchema
-        do {
-            validator = try JSONSchema(.object(schema))
-        } catch {
-            throw MCPError.internalError("the requested schema of \"\(key)\" cannot be enforced: \(error)")
-        }
         let answers = try await input([key: .elicit(ElicitRequest(message: message, requestedSchema: schema))])
         guard case .elicit(let result) = answers[key] else { throw MCPError.internalError("missing answer for \(key)") }
-        if result.action == .accept, let violation = validator.validate(.object(result.content ?? JSONObject())) {
-            let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(violation)"
-            // In 2026-07-28 the answer arrived in this request's own params.
-            throw profile.multiRoundTrip ? MCPError.invalidParams(detail) : MCPError.internalError(detail)
-        }
         return result
     }
 
@@ -218,6 +216,62 @@ public final class RequestContext: Sendable {
         let answers = try await input([key: .roots])
         guard case .roots(let result) = answers[key] else { throw MCPError.internalError("missing answer for \(key)") }
         return result
+    }
+
+    private func elicitationValidators(for requests: KeyValuePairs<String, InputRequest>) throws(MCPError) -> [String: JSONSchema] {
+        var validators: [String: JSONSchema] = [:]
+        for (key, request) in requests {
+            guard case .elicit(let elicitation) = request else { continue }
+            switch elicitation.mode {
+            case .form(let schema):
+                guard schema["type"] == "object",
+                    let fields = (schema["properties"] ?? [:]).objectValue,
+                    fields.allSatisfy({ entry in entry.value.objectValue.map(isElicitationField) == true })
+                else {
+                    throw .internalError("the requested schema of \"\(key)\" must be a flat elicitation form")
+                }
+                do {
+                    validators[key] = try JSONSchema(.object(schema))
+                } catch {
+                    throw .internalError("the requested schema of \"\(key)\" cannot be enforced: \(error)")
+                }
+            case .url(let url):
+                guard !url.utf8.contains(where: { $0 <= 0x20 }), URL(string: url)?.scheme != nil else {
+                    throw .internalError("the URL for elicitation \"\(key)\" must be absolute")
+                }
+            }
+        }
+        return validators
+    }
+
+    private func isElicitationField(_ field: JSONObject) -> Bool {
+        func strings(_ value: JSONValue?) -> Bool {
+            guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
+            return choices.allSatisfy { $0.stringValue != nil }
+        }
+        func titledChoices(_ value: JSONValue?) -> Bool {
+            guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
+            return choices.allSatisfy { $0["const"]?.stringValue != nil && $0["title"]?.stringValue != nil }
+        }
+        switch field["type"]?.stringValue {
+        case "string":
+            if let choices = field["oneOf"] { return profile.urlElicitation && titledChoices(choices) }
+            return field["enum"] == nil || strings(field["enum"])
+        case "number", "integer", "boolean": return true
+        case "array":
+            guard profile.urlElicitation, let items = field["items"]?.objectValue else { return false }
+            if items["type"] == "string" { return strings(items["enum"]) }
+            return titledChoices(items["anyOf"])
+        default: return false
+        }
+    }
+
+    private func validateFormAnswer(_ answer: InputResponse, for key: String, using validator: JSONSchema?) throws(MCPError) {
+        guard let validator, case .elicit(let result) = answer, result.action == .accept,
+            let violation = validator.validate(.object(result.content ?? JSONObject()))
+        else { return }
+        let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(violation)"
+        throw profile.multiRoundTrip ? .invalidParams(detail) : .internalError(detail)
     }
 
     /// The capability `request` needs, if the client did not declare it or the revision lacks it.
@@ -314,7 +368,9 @@ final class InputState: Sendable {
         error.code == MCPError.Code.missingRequiredClientCapability && progress.withLock { $0.missingCapabilityErrors.contains(error) }
     }
 
-    func resolve(_ requests: KeyValuePairs<String, InputRequest>) throws -> [String: InputResponse] {
+    func resolve(
+        _ requests: KeyValuePairs<String, InputRequest>, validate: (String, InputResponse) throws(MCPError) -> Void
+    ) throws -> [String: InputResponse] {
         var resolved: [String: InputResponse] = [:]
         var missing: [(key: String, request: InputRequest)] = []
         for (key, request) in requests {
@@ -322,11 +378,14 @@ final class InputState: Sendable {
                 missing.append((key, request))
                 continue
             }
+            let answer: InputResponse
             do {
-                resolved[key] = try InputResponse(json: raw, for: request)
+                answer = try InputResponse(json: raw, for: request)
             } catch {
                 throw MCPError.invalidParams("inputResponses.\(key): \(error)")
             }
+            try validate(key, answer)
+            resolved[key] = answer
         }
         progress.withLock { progress in
             for (key, _) in requests {
@@ -350,6 +409,8 @@ final class InputState: Sendable {
 }
 
 /// The era and identity a request is served under.
+final class LegacySessionIdentity: Sendable {}
+
 struct Peer: Sendable {
     let profile: RevisionProfile
     let capabilities: ClientCapabilities
@@ -357,4 +418,5 @@ struct Peer: Sendable {
     /// Minimum level for `notifications/message` on this request; `nil` sends none.
     let logLevel: LoggingLevel?
     var negotiatedServerCapabilities: Set<ServerCapability> = []
+    var legacySession: LegacySessionIdentity? = nil
 }
