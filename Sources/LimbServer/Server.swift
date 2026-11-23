@@ -201,6 +201,9 @@ public final class Server: Sendable {
     public func register(
         prompt definition: PromptDefinition, complete: CompletionHandler? = nil, handler: @escaping PromptHandler
     ) throws(RegistrationError) {
+        guard Set(definition.arguments.map(\.name)).count == definition.arguments.count else {
+            throw RegistrationError(reason: "prompt \"\(definition.name)\" declares duplicate or canonically equivalent argument names")
+        }
         let entry = PromptEntry(definition: definition, complete: complete, handler: handler)
         try mutate(.prompts) { contents throws(RegistrationError) in
             guard contents.promptIndex[ExactString(definition.name)] == nil else {
