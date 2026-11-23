@@ -208,12 +208,18 @@ private struct IMDefUserStatic {
     func call(x: Int = 5, s: String = "s", list: [Int] = [1]) -> String { "\(x) \(s) \(list)" }
 }
 
-/// Has a static method with the generated method's name and label, but not generic. (The
-/// exact generic shape is an "invalid redeclaration": IndependentMacroDoesNotCompile.swift, 6.)
+private let labelledDefaultEvaluations = Mutex(0)
+
+private func labelledDefault() -> Int {
+    labelledDefaultEvaluations.withLock { $0 += 1 }
+    return 5
+}
+
+/// A tool with a same-named static overload in the consumer.
 @Tool
 private struct IMDefUserLabelled {
     static func __limbDefault(__limbArgument index: Int) -> Int { 99 }
-    func call(x: Int = 5) -> Int { x }
+    func call(x: Int = labelledDefault()) -> Int { x }
 }
 
 /// Has instance members named like the generated static method.
@@ -315,18 +321,20 @@ private func makeServer() throws -> Server {
         }
     }
 
-    @Test func nullYieldsTheDefaultOfAnOptionalArgument() async throws {
+    @Test func nullIsPassedThroughInsteadOfSelectingAnArgumentDefault() async throws {
         let client = TestClient(try makeServer())
         let response = try await client.independentMacroCall(
-            "im_def_everything", ["opt": nil, "optSome": nil, "optExplicit": nil, "optNone": nil, "e4": nil, "p4": nil, "j3": nil])
+            "im_def_everything", ["opt": nil, "optSome": nil, "optExplicit": nil, "optNone": nil, "e4": nil, "p4": nil, "j1": nil, "j3": nil])
         #expect(response["result"]?["isError"] == false, "\(response)")
         let result = response["result"]?["structuredContent"]
         #expect(result?["opt"] == .null)
-        #expect(result?["optSome"] == 3)
-        #expect(result?["optExplicit"] == 4)
+        #expect(result?["optSome"] == .null)
+        #expect(result?["optExplicit"] == .null)
         #expect(result?["optNone"] == .null)
-        #expect(result?["e4"] == "metric")
+        #expect(result?["e4"] == .null)
         #expect(result?["p4"] == .null)
+        #expect(result?["j1"] == .null)
+        #expect(result?["j3"] == .null)
     }
 
     /// A default is evaluated when it is needed and only then, as in a Swift call: not when
@@ -341,11 +349,11 @@ private func makeServer() throws -> Server {
         #expect(defaultEvaluations.withLock { $0 } == start)
         #expect(try await client.independentMacroCall("im_def_lazy", ["n": 100]).independentMacroFirstText == "100 \(start + 1)")
         #expect(try await client.independentMacroCall("im_def_lazy").independentMacroFirstText == "\(start + 2) \(start + 3)")
-        #expect(try await client.independentMacroCall("im_def_lazy", ["m": nil]).independentMacroFirstText == "\(start + 4) \(start + 5)")
-        #expect(defaultEvaluations.withLock { $0 } == start + 5)
+        #expect(try await client.independentMacroCall("im_def_lazy", ["m": nil]).independentMacroFirstText == "\(start + 4) -1")
+        #expect(defaultEvaluations.withLock { $0 } == start + 4)
         // An argument that fails validation costs no evaluation.
         #expect(try await client.independentMacroCall("im_def_lazy", ["n": "x"])["result"]?["isError"] == true)
-        #expect(defaultEvaluations.withLock { $0 } == start + 5)
+        #expect(defaultEvaluations.withLock { $0 } == start + 4)
     }
 
     @Test func defaultsOverTheToolsGenericParameter() async throws {
@@ -404,12 +412,20 @@ private func makeServer() throws -> Server {
             try await client.independentMacroCall("im_def_user_static", ["x": 1, "s": "t", "list": []]).independentMacroFirstText == "1 t []")
     }
 
-    @Test(.disabled("known limitation: a user's static __limbDefault(__limbArgument:) with a concrete return type is chosen over the generated one"))
-    func aUserStaticMethodWithTheGeneratedLabel() async throws {
+    @Test func aUserStaticMethodWithTheGeneratedLabel() async throws {
+        let start = labelledDefaultEvaluations.withLock { $0 }
         let client = TestClient(try makeServer())
-        let value = try await client.independentMacroCall("im_def_user_labelled")["result"]?["structuredContent"]
-        #expect(value == 5, "the default came from the user's method: \(value ?? .null)")
-        #expect(try await client.independentMacroCall("im_def_user_labelled", ["x": 1])["result"]?["structuredContent"] == 1)
+        let name = IMDefUserLabelled.definition.name
+        _ = try #require(try await client.independentMacroListed(name))
+        #expect(labelledDefaultEvaluations.withLock { $0 } == start)
+
+        let explicit = try await client.independentMacroCall(name, ["x": 1])
+        #expect(explicit["result"]?["structuredContent"] == 1)
+        #expect(labelledDefaultEvaluations.withLock { $0 } == start)
+
+        let omitted = try await client.independentMacroCall(name)
+        #expect(omitted["result"]?["structuredContent"] == 5, "\(omitted)")
+        #expect(labelledDefaultEvaluations.withLock { $0 } == start + 1)
     }
 
     @Test func userInstanceMembersNamedLikeTheGeneratedOne() async throws {

@@ -534,21 +534,19 @@ private struct IMGraphNode: Equatable {
         #expect(decoded == IMOptionalWithDefault())
         // A present value still wins.
         #expect(try IMOptionalWithDefault(json: ["limit": 1, "name": "n"]) == IMOptionalWithDefault(limit: 1, name: "n"))
-        #expect(try IMOptionalWithDefault(json: ["limit": nil, "name": nil]) == IMOptionalWithDefault())
+        #expect(try IMOptionalWithDefault(json: ["limit": nil, "name": nil]) == IMOptionalWithDefault(limit: nil, name: nil))
         #expect(try JSONSchema(.object(IMOptionalWithDefault.jsonSchema)).validate(["limit": nil, "name": nil]) == nil)
         IndependentMacroCheckRoundTrip(IMOptionalWithDefault())
         IndependentMacroCheckRoundTrip(IMOptionalWithDefault(limit: 1, name: "n"))
-        // observed, a consequence of the rule: a property that is optional and has a non-nil
-        // default cannot be set to `nil` through JSON; `nil` is encoded by omission and comes
-        // back as the default.
         let cleared = IMOptionalWithDefault(limit: nil, name: nil)
-        #expect(cleared.jsonValue == [:])
-        #expect(try IMOptionalWithDefault(json: cleared.jsonValue) == IMOptionalWithDefault())
+        #expect(cleared.jsonValue == ["limit": .null, "name": .null])
+        #expect(try IMOptionalWithDefault(json: cleared.jsonValue) == cleared)
     }
 
     @Test func nullForANonOptionalPropertyWithADefault() throws {
         let json: JSONValue = ["required": "r", "count": nil, "tags": nil]
-        #expect(try IMDefaults(json: json) == IMDefaults(required: "r"))
+        let error = #expect(throws: JSONDecodingError.self) { try IMDefaults(json: json) }
+        if let error { #expect(error.path == ["count"]) }
         #expect(try JSONSchema(.object(IMDefaults.jsonSchema)).validate(json) != nil)
     }
 
@@ -651,7 +649,7 @@ private struct IMGraphNode: Equatable {
         #expect(IMScalars.jsonSchema["additionalProperties"] == nil)
     }
 
-    @Test func optionalPropertiesTreatNullAsAbsent() throws {
+    @Test func optionalPropertiesWithoutDefaultsDecodeNullAsNil() throws {
         let decoded = try IMOptionals(json: ["text": nil, "count": nil, "list": nil, "map": nil])
         #expect(decoded == IMOptionals(text: nil, flag: nil, count: nil, wide: nil, ratio: nil, spelledOut: nil, list: nil, map: nil))
         // …but a present value of the wrong type is still an error.

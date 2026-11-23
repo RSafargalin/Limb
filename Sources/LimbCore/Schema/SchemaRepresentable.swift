@@ -13,6 +13,14 @@ public protocol SchemaRepresentable: JSONDecodable, JSONEncodable {
     /// writes a `$ref` to a definition instead of descending forever.
     static func jsonSchema(in builder: inout SchemaBuilder) -> JSONObject
     var jsonValue: JSONValue { get }
+    /// Converts this value with a limit on nested JSON arrays and objects. A custom recursive
+    /// conformer can override this method to check the limit before recursing.
+    func jsonValue(maxDepth: Int) throws(JSONEncodingDepthError) -> JSONValue
+}
+
+/// A typed value needs more levels of JSON arrays and objects than the caller permits.
+public struct JSONEncodingDepthError: Error, Sendable {
+    public init() {}
 }
 
 extension SchemaRepresentable {
@@ -24,6 +32,25 @@ extension SchemaRepresentable {
     }
 
     public func encode(to writer: inout JSONWriter) { writer.write(jsonValue) }
+
+    public func jsonValue(maxDepth: Int) throws(JSONEncodingDepthError) -> JSONValue {
+        let value = jsonValue
+        // Custom conformers using the default method may already have built their tree.
+        var pending = [(value, max(0, maxDepth))]
+        while let (element, remaining) = pending.popLast() {
+            switch element {
+            case .array(let array):
+                guard remaining > 0 else { throw JSONEncodingDepthError() }
+                for child in array { pending.append((child, remaining - 1)) }
+            case .object(let object):
+                guard remaining > 0 else { throw JSONEncodingDepthError() }
+                for (_, child) in object { pending.append((child, remaining - 1)) }
+            default:
+                break
+            }
+        }
+        return value
+    }
 }
 
 /// Assembles one schema document out of the schemas of the types it mentions.
@@ -150,6 +177,14 @@ extension Array: SchemaRepresentable where Element: SchemaRepresentable {
     }
 
     public var jsonValue: JSONValue { .array(map(\.jsonValue)) }
+
+    public func jsonValue(maxDepth: Int) throws(JSONEncodingDepthError) -> JSONValue {
+        guard maxDepth > 0 else { throw JSONEncodingDepthError() }
+        var values: [JSONValue] = []
+        values.reserveCapacity(count)
+        for element in self { values.append(try element.jsonValue(maxDepth: maxDepth - 1)) }
+        return .array(values)
+    }
 }
 
 extension Optional: SchemaRepresentable where Wrapped: SchemaRepresentable {
@@ -161,6 +196,10 @@ extension Optional: SchemaRepresentable where Wrapped: SchemaRepresentable {
     }
 
     public var jsonValue: JSONValue { self?.jsonValue ?? .null }
+
+    public func jsonValue(maxDepth: Int) throws(JSONEncodingDepthError) -> JSONValue {
+        try self?.jsonValue(maxDepth: maxDepth) ?? .null
+    }
 }
 
 /// Lets generic code ask "is this type an Optional?" and "is this value absent?" without
@@ -196,6 +235,15 @@ extension Dictionary: SchemaRepresentable where Key == String, Value: SchemaRepr
     public var jsonValue: JSONValue {
         // Every key comes from the dictionary itself.
         .object(JSONObject(keys.sorted().map { ($0, self[$0]!.jsonValue) }))
+    }
+
+    public func jsonValue(maxDepth: Int) throws(JSONEncodingDepthError) -> JSONValue {
+        guard maxDepth > 0 else { throw JSONEncodingDepthError() }
+        var object = JSONObject(minimumCapacity: count)
+        for (key, value) in sorted(by: { $0.key < $1.key }) {
+            object.appendUnchecked(key, try value.jsonValue(maxDepth: maxDepth - 1))
+        }
+        return .object(object)
     }
 }
 
@@ -285,11 +333,11 @@ public enum SchemaSupport {
         defaultValue()
     }
 
-    /// Decodes a member that has a default: an absent or `null` member yields the default.
+    /// Decodes a member that has a default. Only an absent key uses the default.
     public static func decode<T: JSONDecodable>(
         _ object: JSONObject, _ key: String, default defaultValue: @autoclosure () -> T
     ) throws(JSONDecodingError) -> T {
-        guard let value = object[key], !value.isNull else { return defaultValue() }
+        guard let value = object[key] else { return defaultValue() }
         do {
             return try T(json: value)
         } catch {
@@ -297,22 +345,29 @@ public enum SchemaSupport {
         }
     }
 
-    /// Decodes a member of the type `keyPath` leads to, or `nil` when it is absent or `null`.
-    /// For properties that keep their declared default in that case.
+    /// Decodes a member of the type `keyPath` leads to. An absent key leaves its default intact.
+    /// A present JSON null is decoded by the property type.
     public static func decodeIfPresent<Root, T: JSONDecodable>(
         _ object: JSONObject, _ key: String, for keyPath: KeyPath<Root, T>
     ) throws(JSONDecodingError) -> T? {
-        guard let value = object[key], !value.isNull else { return nil }
+        guard let value = object[key] else { return nil }
         do {
-            return try T(json: value)
+            return .some(try T(json: value))
         } catch {
             throw error.nested(in: key)
         }
     }
 
-    /// Adds a member unless the value is an absent optional.
-    public static func set<T: SchemaRepresentable>(_ object: inout JSONObject, _ key: String, _ value: T) {
-        if let optional = value as? any AbsentRepresentable, optional.isAbsent { return }
+    /// Adds a member. Defaulted optional properties need explicit nulls to round-trip `nil`.
+    public static func set<T: SchemaRepresentable>(_ object: inout JSONObject, _ key: String, _ value: T, includeNil: Bool = false) {
+        if !includeNil, let optional = value as? any AbsentRepresentable, optional.isAbsent { return }
         object.appendUnchecked(key, value.jsonValue)
+    }
+
+    public static func set<T: SchemaRepresentable>(
+        _ object: inout JSONObject, _ key: String, _ value: T, includeNil: Bool = false, maxDepth: Int
+    ) throws(JSONEncodingDepthError) {
+        if !includeNil, let optional = value as? any AbsentRepresentable, optional.isAbsent { return }
+        object.appendUnchecked(key, try value.jsonValue(maxDepth: maxDepth))
     }
 }

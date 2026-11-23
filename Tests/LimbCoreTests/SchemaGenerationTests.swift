@@ -606,9 +606,11 @@ private func compiled<T: SchemaRepresentable>(_ type: T.Type) throws -> JSONSche
         #expect(failure("tags", as: [Int].self) == "tags.[0]: expected integer, got string")
         #expect(failure("nested", as: [String: [Int]].self) == "nested.list.[1]: expected integer, got string")
         #expect(failure("count", as: Bool.self) == "count: expected boolean, got integer")
-        // With a default: absent and null both yield it; a wrong type is still an error.
+        // A default supplies the value of an omitted member.
         #expect(try SchemaSupport.decode(object, "missing", default: 7) == 7)
-        #expect(try SchemaSupport.decode(object, "null", default: 7) == 7)
+        #expect(throws: JSONDecodingError("expected integer, got null", path: ["null"])) {
+            try SchemaSupport.decode(object, "null", default: 7)
+        }
         #expect(try SchemaSupport.decode(object, "count", default: 7) == 3)
         #expect(try SchemaSupport.decode(object, "missing", default: ["x"]) == ["x"])
         #expect(throws: JSONDecodingError("expected integer, got string", path: ["name"])) { try SchemaSupport.decode(object, "name", default: 7) }
@@ -625,7 +627,9 @@ private func compiled<T: SchemaRepresentable>(_ type: T.Type) throws -> JSONSche
         // If present.
         #expect(try SchemaSupport.decodeIfPresent(object, "count", for: \Library.count) == 3)
         #expect(try SchemaSupport.decodeIfPresent(object, "missing", for: \Library.count) == nil)
-        #expect(try SchemaSupport.decodeIfPresent(object, "null", for: \Library.count) == nil)
+        #expect(throws: JSONDecodingError("expected integer, got null", path: ["null"])) {
+            try SchemaSupport.decodeIfPresent(object, "null", for: \Library.count)
+        }
         #expect(throws: JSONDecodingError("expected integer, got string", path: ["name"])) {
             try SchemaSupport.decodeIfPresent(object, "name", for: \Library.count)
         }

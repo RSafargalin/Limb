@@ -62,8 +62,21 @@ import Testing
                     LimbCore.SchemaSupport.set(&__limbObject, "temperature", self.temperature)
                     LimbCore.SchemaSupport.set(&__limbObject, "conditions", self.conditions)
                     LimbCore.SchemaSupport.set(&__limbObject, "rain", self.rain)
-                    LimbCore.SchemaSupport.set(&__limbObject, "tags", self.tags)
+                    LimbCore.SchemaSupport.set(&__limbObject, "tags", self.tags, includeNil: true)
                     LimbCore.SchemaSupport.set(&__limbObject, "units", self.units)
+                    return .object(__limbObject)
+                }
+
+                func jsonValue(maxDepth __limbDepth: Swift.Int) throws(LimbCore.JSONEncodingDepthError) -> LimbCore.JSONValue {
+                    guard __limbDepth > 0 else {
+                        throw LimbCore.JSONEncodingDepthError()
+                    }
+                    var __limbObject = LimbCore.JSONObject(minimumCapacity: 5)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "temperature", self.temperature, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "conditions", self.conditions, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "rain", self.rain, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "tags", self.tags, includeNil: true, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "units", self.units, maxDepth: __limbDepth - 1)
                     return .object(__limbObject)
                 }
             }
@@ -167,25 +180,20 @@ import Testing
                     let __limbArgument2: Int?
                     do throws(LimbCore.JSONDecodingError) {
                         __limbArgument0 = try LimbCore.SchemaSupport.decode(__limbArguments, "location")
-                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "units", default: Self.__limbDefault(__limbArgument: 1 as Swift.Int))
-                    __limbArgument2 = try LimbCore.SchemaSupport.decode(__limbArguments, "days", default: Self.__limbDefault(__limbArgument: 2 as Swift.Int))
+                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "units", default: Self.__macro_local_11limbDefaultfMu_())
+                    __limbArgument2 = try LimbCore.SchemaSupport.decode(__limbArguments, "days", default: Self.__macro_local_11limbDefaultfMu0_())
                     } catch {
                         throw LimbServer.ToolSupport.invalidArguments(error)
                     }
-                    return LimbServer.ToolSupport.result(try await self.call(location: __limbArgument0, units: __limbArgument1, days: __limbArgument2, context: __limbContext))
+                    return try LimbServer.ToolSupport.result(await self.call(location: __limbArgument0, units: __limbArgument1, days: __limbArgument2, context: __limbContext), context: __limbContext)
                 }
 
-                private static func __limbDefault<__LimbValue>(__limbArgument __limbIndex: Swift.Int) -> __LimbValue {
-                    switch __limbIndex {
-                    case 1:
-                        let __limbDefault: Units = (.metric);
-                        return __limbDefault as! __LimbValue
-                    case 2:
-                        let __limbDefault: Int? = (nil);
-                        return __limbDefault as! __LimbValue
-                    default:
-                        fatalError("no default for argument \(__limbIndex)")
-                    }
+                private static func __macro_local_11limbDefaultfMu_() -> Units {
+                    (.metric)
+                }
+
+                private static func __macro_local_11limbDefaultfMu0_() -> Int? {
+                    (nil)
                 }
             }
 
@@ -274,21 +282,15 @@ import Testing
                     let __limbArgument1: Int
                     do throws(LimbCore.JSONDecodingError) {
                         __limbArgument0 = try LimbCore.SchemaSupport.decode(__limbArguments, "text")
-                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "times", default: Self.__limbDefault(__limbArgument: 1 as Swift.Int))
+                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "times", default: Self.__macro_local_11limbDefaultfMu_())
                     } catch {
                         throw LimbServer.ToolSupport.invalidArguments(error)
                     }
-                    return LimbServer.ToolSupport.result(self.call(__limbArgument0, times: __limbArgument1))
+                    return try LimbServer.ToolSupport.result(self.call(__limbArgument0, times: __limbArgument1), context: __limbContext)
                 }
 
-                private static func __limbDefault<__LimbValue>(__limbArgument __limbIndex: Swift.Int) -> __LimbValue {
-                    switch __limbIndex {
-                    case 1:
-                        let __limbDefault: Int = (1);
-                        return __limbDefault as! __LimbValue
-                    default:
-                        fatalError("no default for argument \(__limbIndex)")
-                    }
+                private static func __macro_local_11limbDefaultfMu_() -> Int {
+                    (1)
                 }
             }
 
@@ -323,6 +325,15 @@ import Testing
                 }
 
                 public var jsonValue: LimbCore.JSONValue {
+                    let __limbObject = LimbCore.JSONObject(minimumCapacity: 0)
+
+                    return .object(__limbObject)
+                }
+
+                public func jsonValue(maxDepth __limbDepth: Swift.Int) throws(LimbCore.JSONEncodingDepthError) -> LimbCore.JSONValue {
+                    guard __limbDepth > 0 else {
+                        throw LimbCore.JSONEncodingDepthError()
+                    }
                     let __limbObject = LimbCore.JSONObject(minimumCapacity: 0)
 
                     return .object(__limbObject)
@@ -379,7 +390,19 @@ import Testing
                     LimbCore.SchemaSupport.set(&__limbObject, "default", self.`default`)
                     LimbCore.SchemaSupport.set(&__limbObject, "a", self.a)
                     LimbCore.SchemaSupport.set(&__limbObject, "b", self.b)
-                    LimbCore.SchemaSupport.set(&__limbObject, "watched", self.watched)
+                    LimbCore.SchemaSupport.set(&__limbObject, "watched", self.watched, includeNil: true)
+                    return .object(__limbObject)
+                }
+
+                func jsonValue(maxDepth __limbDepth: Swift.Int) throws(LimbCore.JSONEncodingDepthError) -> LimbCore.JSONValue {
+                    guard __limbDepth > 0 else {
+                        throw LimbCore.JSONEncodingDepthError()
+                    }
+                    var __limbObject = LimbCore.JSONObject(minimumCapacity: 4)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "default", self.`default`, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "a", self.a, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "b", self.b, maxDepth: __limbDepth - 1)
+                    try LimbCore.SchemaSupport.set(&__limbObject, "watched", self.watched, includeNil: true, maxDepth: __limbDepth - 1)
                     return .object(__limbObject)
                 }
             }
@@ -427,8 +450,8 @@ import Testing
                     let __limbArgument2: Bool
                     do throws(LimbCore.JSONDecodingError) {
                         __limbArgument0 = try LimbCore.SchemaSupport.decode(__limbArguments, "in")
-                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "by", default: Self.__limbDefault(__limbArgument: 1 as Swift.Int))
-                    __limbArgument2 = try LimbCore.SchemaSupport.decode(__limbArguments, "inout", default: Self.__limbDefault(__limbArgument: 2 as Swift.Int))
+                    __limbArgument1 = try LimbCore.SchemaSupport.decode(__limbArguments, "by", default: Self.__macro_local_11limbDefaultfMu_())
+                    __limbArgument2 = try LimbCore.SchemaSupport.decode(__limbArguments, "inout", default: Self.__macro_local_11limbDefaultfMu0_())
                     } catch {
                         throw LimbServer.ToolSupport.invalidArguments(error)
                     }
@@ -436,17 +459,12 @@ import Testing
                     return LimbCore.ToolResult()
                 }
 
-                private static func __limbDefault<__LimbValue>(__limbArgument __limbIndex: Swift.Int) -> __LimbValue {
-                    switch __limbIndex {
-                    case 1:
-                        let __limbDefault: Int = (step + 1);
-                        return __limbDefault as! __LimbValue
-                    case 2:
-                        let __limbDefault: Bool = (false);
-                        return __limbDefault as! __LimbValue
-                    default:
-                        fatalError("no default for argument \(__limbIndex)")
-                    }
+                private static func __macro_local_11limbDefaultfMu_() -> Int {
+                    (step + 1)
+                }
+
+                private static func __macro_local_11limbDefaultfMu0_() -> Bool {
+                    (false)
                 }
             }
 
