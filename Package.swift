@@ -40,8 +40,9 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"700.0.0"),
     ],
     targets: [
-        // JSON, JSON-RPC, revisions, errors, framing, schema validation. No dependencies.
-        .target(name: "LimbCore", swiftSettings: settings),
+        // JSON, JSON-RPC, revisions, errors, framing, schema validation.
+        .target(name: "LimbCore", dependencies: [.target(name: "CLimbStack", condition: .when(platforms: [.linux]))], swiftSettings: settings),
+        .target(name: "CLimbStack"),
         // @Tool and @Schema. A compiler plugin: built for the build machine, never linked into the app.
         .macro(
             name: "LimbMacros",
