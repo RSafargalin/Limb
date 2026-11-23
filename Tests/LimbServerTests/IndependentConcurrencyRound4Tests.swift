@@ -342,7 +342,13 @@ struct IndependentConcurrencyKilobyteRuleTests {
             var descriptor = pollfd(fd: fromServer.read, events: Int16(POLLIN), revents: 0)
             guard poll(&descriptor, 1, timeoutMilliseconds) > 0 else { return 0 }
             var buffer = [UInt8](repeating: 0, count: limit)
+            #if canImport(Darwin)
             let count = Darwin.read(fromServer.read, &buffer, limit)
+            #elseif canImport(Glibc)
+            let count = Glibc.read(fromServer.read, &buffer, limit)
+            #else
+            let count = Musl.read(fromServer.read, &buffer, limit)
+            #endif
             guard count > 0 else { return -1 }
             received += count
             tail = Array((tail + buffer[..<count]).suffix(8))
