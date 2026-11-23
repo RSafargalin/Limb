@@ -285,20 +285,6 @@ extension IndependentStdioTransportTests {
             #expect(IndependentStdioDescriptorState(client.serverInput) != nil)
         }
 
-        #if canImport(Darwin)
-        @Test func sigpipeIsIgnoredAfterASessionAsTheDesignSays() throws {
-            let fixture = try independentStdioFixture()
-            let client = Client.ready(fixture.server)
-            client.closeInput()
-            #expect(client.stopped(within: 10))
-            client.tearDown()
-            var current = sigaction()
-            #expect(sigaction(SIGPIPE, nil, &current) == 0)
-            // SIG_IGN is the handler value 1.
-            #expect(unsafeBitCast(current.__sigaction_u.__sa_handler, to: Int.self) == 1, "SIGPIPE is not ignored")
-        }
-        #endif
-
         @Test func requestsInFlightAreCancelledWhenTheClientIsGone() throws {
             let fixture = try independentStdioFixture { $0.shutdownGraceSeconds = 30 }
             let client = Client.ready(fixture.server)

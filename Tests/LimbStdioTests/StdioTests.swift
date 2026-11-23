@@ -321,7 +321,7 @@ final class Gate: Sendable {
     }
 
     /// The old body of the test above: the peer closes its end, and the server's writes fail
-    /// with EPIPE. `Peer` no longer ignores SIGPIPE itself, so this also shows that `run` does.
+    /// with EPIPE. The writer handles the closed pipe without terminating the process.
     @Test func aPeerThatClosedItsEndDoesNotCrashOrHangTheServer() async throws {
         let peer = Peer(try makeStdioServer())
         _ = peer.initialize()

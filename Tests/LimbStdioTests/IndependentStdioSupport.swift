@@ -429,9 +429,10 @@ final class IndependentStdioClient: @unchecked Sendable {
     /// the main thread's open mask, so there signals do arrive.) `run` reaches the creation of
     /// its threads without suspending, that is on the thread that unblocked the signal.
     @discardableResult
-    func start(signals: Bool = false) -> Self {
-        let transport = StdioTransport(input: serverInput, output: serverOutput)
-        task = Task { [server, self] in
+    func start(signals: Bool = false, configureTransport: (inout StdioTransport) -> Void = { _ in }) -> Self {
+        var transport = StdioTransport(input: serverInput, output: serverOutput)
+        configureTransport(&transport)
+        task = Task { [server, self, transport] in
             if signals {
                 var set = sigset_t()
                 sigemptyset(&set)

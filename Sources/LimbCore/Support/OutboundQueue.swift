@@ -38,6 +38,18 @@ extension FrameSink {
 
 /// A byte-budgeted queue of outgoing frames with a single blocking consumer.
 public final class OutboundQueue: FrameSink, @unchecked Sendable {
+    package final class FrameLease: Sendable {
+        package let bytes: [UInt8]
+        package let key: RequestID?
+        fileprivate let urgent: Bool
+
+        fileprivate init(bytes: [UInt8], key: RequestID?, urgent: Bool) {
+            self.bytes = bytes
+            self.key = key
+            self.urgent = urgent
+        }
+    }
+
     private struct Entry {
         var frame: [UInt8]
         var key: RequestID?
@@ -46,7 +58,9 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
     }
 
     private let lock = ConditionLock()
-    private var entries: [Entry] = []
+    private var entries: [Entry?] = []
+    private var head = 0
+    private var selected: FrameLease?
     /// Ordinary bytes queued or handed to the writer but not yet written.
     private var pendingBytes = 0
     /// The same for urgent frames. They are counted apart, so that ordinary output — however
@@ -89,10 +103,11 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
         if replacesProgress, let key {
             // Only the latest unwritten progress value per request is worth sending.
             if queuedProgress.contains(key),
-                let index = entries.lastIndex(where: { $0.isProgress && $0.key == key })
+                let index = entries.lastIndex(where: { $0?.isProgress == true && $0?.key == key }),
+                let previous = entries[index]
             {
-                pendingBytes += frame.count - entries[index].frame.count
-                entries[index].frame = frame
+                pendingBytes += frame.count - previous.frame.count
+                entries[index]?.frame = frame
                 return true
             }
             queuedProgress.insert(key)
@@ -141,9 +156,15 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
         var freed = 0
         var freedUrgent = 0
         entries.removeAll { entry in
+            guard let entry else { return true }
             guard entry.key == key else { return false }
             if entry.isUrgent { freedUrgent += entry.frame.count } else { freed += entry.frame.count }
             return true
+        }
+        head = 0
+        if let selected, selected.key == key {
+            if selected.urgent { freedUrgent += selected.bytes.count } else { freed += selected.bytes.count }
+            self.selected = nil
         }
         pendingBytes -= freed
         urgentBytes -= freedUrgent
@@ -169,7 +190,46 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
     /// What the queue holds right now: bytes queued or handed to the writer and not yet reported
     /// written, by kind, and the number of frames still queued. For metrics and for tests.
     public var usage: (ordinaryBytes: Int, urgentBytes: Int, queuedFrames: Int) {
-        lock.withLock { (pendingBytes, urgentBytes, entries.count) }
+        lock.withLock { (pendingBytes, urgentBytes, entries.count - head) }
+    }
+
+    /// Selects a single frame without committing it to the writer. Only the writer may select
+    /// a frame, and it settles that frame before selecting the next one.
+    package func takeFrame() -> FrameLease? {
+        lock.withLock {
+            precondition(selected == nil)
+            while head == entries.count {
+                if closed { return nil }
+                lock.wait()
+            }
+            guard let entry = entries[head] else { preconditionFailure("queue head has no frame") }
+            entries[head] = nil
+            head += 1
+            if head >= 64, head >= entries.count - head {
+                entries.removeFirst(head)
+                head = 0
+            }
+            if entry.isProgress, let key = entry.key { queuedProgress.remove(key) }
+            let lease = FrameLease(bytes: entry.frame, key: entry.key, urgent: entry.isUrgent)
+            selected = lease
+            return lease
+        }
+    }
+
+    package func isCurrent(_ lease: FrameLease) -> Bool { lock.withLock { selected === lease } }
+
+    /// Runs an immediately available first write while cancellation and the writer agree on
+    /// ownership. A positive write commits the whole frame. A retry leaves it withdrawable.
+    package func writeIfCurrent(_ lease: FrameLease, _ write: ([UInt8]) -> Int) -> Int? {
+        lock.withLock {
+            guard selected === lease else { return nil }
+            let written = write(lease.bytes)
+            if written > 0 {
+                if lease.urgent { takenUrgent += lease.bytes.count } else { takenOrdinary += lease.bytes.count }
+                selected = nil
+            }
+            return written
+        }
     }
 
     /// Blocks until frames are available and returns all of them, in order; `nil` once the
@@ -177,7 +237,7 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
     public func take() -> [[UInt8]]? {
         lock.lock()
         defer { lock.unlock() }
-        while entries.isEmpty {
+        while head == entries.count {
             if closed { return nil }
             lock.wait()
         }
@@ -185,11 +245,14 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
     }
 
     private func takeLocked() -> [[UInt8]] {
-        for entry in entries {
+        var batch: [[UInt8]] = []
+        batch.reserveCapacity(entries.count - head)
+        for case let entry? in entries[head...] {
             if entry.isUrgent { takenUrgent += entry.frame.count } else { takenOrdinary += entry.frame.count }
+            batch.append(entry.frame)
         }
-        let batch = entries.map(\.frame)
         entries.removeAll(keepingCapacity: true)
+        head = 0
         queuedProgress.removeAll(keepingCapacity: true)
         return batch
     }
@@ -212,6 +275,10 @@ public final class OutboundQueue: FrameSink, @unchecked Sendable {
     /// room now.
     public func didWrite() {
         lock.lock()
+        if let selected {
+            if selected.urgent { urgentBytes -= selected.bytes.count } else { pendingBytes -= selected.bytes.count }
+            self.selected = nil
+        }
         pendingBytes -= takenOrdinary
         urgentBytes -= takenUrgent
         takenOrdinary = 0
