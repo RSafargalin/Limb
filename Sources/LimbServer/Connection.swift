@@ -1005,7 +1005,7 @@ public final class Connection: Sendable {
             guard let opened = try? server.sealer.open(sealed), let payload = RequestStatePayload(opened) else {
                 throw MCPError.invalidParams("requestState: failed verification")
             }
-            guard payload.expires >= unixTime() else { throw MCPError.invalidParams("requestState: expired") }
+            guard payload.expires > unixTime() else { throw MCPError.invalidParams("requestState: expired") }
             guard (payload.version == .principalBound) == (version == .principalBound) else {
                 throw MCPError.invalidParams("requestState: issued for a different request")
             }

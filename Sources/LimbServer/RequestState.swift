@@ -113,7 +113,7 @@ struct RequestStatePayload {
     }
 
     var version: Version
-    /// Unix time after which the state is refused.
+    /// Unix time at which the state expires.
     var expires: Int
     /// Identifies the request the state was issued for, so it cannot be replayed on another one.
     var fingerprint: String
