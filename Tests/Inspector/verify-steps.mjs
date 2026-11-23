@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { assertCancelledResponseAbsent } from "./observations.mjs";
 
 const stepsURI = "limb-fixture://state/steps";
 
@@ -15,7 +16,31 @@ export async function checkProgressAndCancellation(
       versionNegotiation: era === "modern" ? { mode: { pin: version } } : { mode: "legacy" },
     },
   );
-  const transport = new StdioClientTransport({
+  const cancellationFrames = [];
+  let captureCancellation = false;
+  let cancelledId;
+  let cancelledProgressToken;
+  class ObservedTransport extends StdioClientTransport {
+    async start() {
+      const receive = this.onmessage;
+      this.onmessage = (message, extra) => {
+        if (captureCancellation) cancellationFrames.push(message);
+        receive?.call(this, message, extra);
+      };
+      await super.start();
+    }
+
+    async send(message, options) {
+      if (message.method === "tools/call" && message.params?.name === "run_steps"
+          && message.params?.arguments?.mode === "cancel") {
+        assert.equal(cancelledId, undefined, "Expected one cancellable call");
+        cancelledId = message.id;
+        cancelledProgressToken = message.params._meta?.progressToken;
+      }
+      await super.send(message, options);
+    }
+  }
+  const transport = new ObservedTransport({
     command: binary,
     args: [version],
     stderr: "ignore",
@@ -70,10 +95,10 @@ export async function checkProgressAndCancellation(
       signal: controller.signal,
       onprogress: (progress) => {
         cancellationProgress.push(progress);
+        captureCancellation = true;
         controller.abort(new Error("cancel run_steps after observing progress"));
       },
     }), { message: /cancel run_steps after observing progress/ });
-    assert.deepEqual(cancellationProgress, [{ progress: 1, total: 2, message: "started" }]);
 
     // The client aborts locally before the fixture processes the cancellation notification.
     const deadline = performance.now() + timeout;
@@ -86,7 +111,10 @@ export async function checkProgressAndCancellation(
     }
     assert.equal(state, "cancelled", "The fixture should observe the cancellation notification");
     assertResult(await call("echo", { text: echoText }), echoText);
+    assert.deepEqual(cancellationProgress, [{ progress: 1, total: 2, message: "started" }]);
   } finally {
     await client.close();
   }
+  assert.ok(typeof cancelledProgressToken === "string" || Number.isSafeInteger(cancelledProgressToken), "Missing progress token used for the cancelled request");
+  assertCancelledResponseAbsent(cancellationFrames, cancelledId, cancelledProgressToken);
 }
