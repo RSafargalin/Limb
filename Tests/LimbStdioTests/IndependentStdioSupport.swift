@@ -157,15 +157,15 @@ func independentStdioFixture(configure: (inout ServerConfiguration) -> Void = { 
         let tag = arguments["tag"]?.stringValue ?? "?"
         probe.started(tag)
         let end = ContinuousClock.now + .milliseconds(arguments["ms"]?.intValue ?? 0)
-        var noted = false
-        while ContinuousClock.now < end {
-            if Task.isCancelled {
-                if !noted { probe.cancelled(tag) }
-                noted = true
-                usleep(5000)
-            } else {
-                try? await Task.sleep(for: .milliseconds(5))
-            }
+        do {
+            try await Task.sleep(until: end, clock: .continuous)
+        } catch {
+            probe.cancelled(tag)
+            // Keep the handler active until its original deadline without occupying a
+            // cooperative executor thread that the transport needs for the grace timer.
+            await Task.detached {
+                try? await Task.sleep(until: end, clock: .continuous)
+            }.value
         }
         probe.finished(tag)
         return .text("stubborn \(tag)")
