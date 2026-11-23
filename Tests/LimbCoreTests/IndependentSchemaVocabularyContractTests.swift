@@ -278,13 +278,17 @@ import Testing
             ]]
         }
         let schema: JSONValue = ["$schema": .string(uri)]
-        for valid in ["https://example.test/vocabulary", "https://example.test/Vocabulary%2FName"] {
+        for valid in [
+            "https://example.test/vocabulary", "https://example.test/Vocabulary%2FName",
+            "https://[2001:db8::1]/vocabulary", "example://[v1.foo:bar]/Vocabulary", "example://%C3%89/vocabulary",
+        ] {
             let compiled = try JSONSchema(schema, registeredSchemas: registry(valid))
             #expect(compiled.validate("oak") == nil)
         }
         for invalid in [
             "relative/vocabulary", "HTTPS://example.test/vocabulary", "https://EXAMPLE.test/vocabulary",
             "https://example.test/a/../vocabulary", "https://example.test/%76ocabulary", "https://example.test/Vocabulary%2fName",
+            "example://[garbage]/vocabulary", "example://[v.example]/vocabulary", "example://[v1.]/vocabulary",
         ] {
             #expect(throws: JSONSchemaError.self, "\(invalid)") {
                 try JSONSchema(schema, registeredSchemas: registry(invalid))

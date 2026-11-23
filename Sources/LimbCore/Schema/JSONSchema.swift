@@ -1,4 +1,11 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 
 /// A schema could not be compiled: it is malformed, uses an unsupported dialect or keyword,
 /// references something outside itself, or exceeds the resource bounds.
@@ -552,7 +559,7 @@ private struct Compiler {
     private static func isNormalizedVocabularyURI(_ name: String) -> Bool {
         guard let uri = URLComponents(string: name, encodingInvalidCharacters: false),
             let scheme = uri.scheme, scheme == scheme.lowercased(),
-            uri.host.map({ $0 == $0.lowercased() }) ?? true,
+            uri.percentEncodedHost.map(isNormalizedURIHost) ?? true,
             !uri.percentEncodedPath.split(separator: "/").contains(where: { $0 == "." || $0 == ".." })
         else { return false }
 
@@ -568,12 +575,41 @@ private struct Compiler {
             guard byte > 0x20, byte < 0x7F else { return false }
             guard byte == 0x25 else { continue }
             guard let high = bytes.next().flatMap(upperHex), let low = bytes.next().flatMap(upperHex) else { return false }
-            switch high << 4 | low {
-            case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E: return false
-            default: break
-            }
+            if isUnreservedURIByte(high << 4 | low) { return false }
         }
         return true
+    }
+
+    private static func isUnreservedURIByte(_ byte: UInt8) -> Bool {
+        switch byte {
+        case 0x41...0x5A, 0x61...0x7A, 0x30...0x39, 0x2D, 0x2E, 0x5F, 0x7E: true
+        default: false
+        }
+    }
+
+    private static func isNormalizedURIHost(_ host: String) -> Bool {
+        var bytes = host.utf8.makeIterator()
+        while let byte = bytes.next() {
+            if byte == 0x25 {
+                // Escapes are checked against the original URI. Their hex digits are not host letters.
+                _ = bytes.next()
+                _ = bytes.next()
+            } else if (0x41...0x5A).contains(byte) {
+                return false
+            }
+        }
+        guard host.first == "[" else { return true }
+        guard host.last == "]" else { return false }
+        let literal = host.dropFirst().dropLast()
+        var address = in6_addr()
+        if String(literal).withCString({ inet_pton(AF_INET6, $0, &address) }) == 1 { return true }
+
+        // RFC 3986 also permits forward-compatible IP literals of the form v<hex>.<address>.
+        guard literal.first == "v", let dot = literal.firstIndex(of: ".") else { return false }
+        let version = literal[literal.index(after: literal.startIndex)..<dot].utf8
+        let endpoint = literal[literal.index(after: dot)...].utf8
+        return !version.isEmpty && version.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+            && !endpoint.isEmpty && endpoint.allSatisfy { isUnreservedURIByte($0) || "!$&'()*+,;=:".utf8.contains($0) }
     }
 
     /// Indexes schema positions and named resources before references are followed. IDs are
