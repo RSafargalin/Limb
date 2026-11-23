@@ -11,6 +11,7 @@ import Musl
 #endif
 #if os(Linux)
 import CDispatch
+import CLimbPosix
 #endif
 
 /// Newline-delimited JSON-RPC over a pair of file descriptors: stdin and stdout by default,
@@ -264,7 +265,7 @@ final class StdioSession: Sendable {
             descriptors = [-1, -1]
         }
         #else
-        let created = pipe2(&descriptors, O_CLOEXEC) == 0
+        let created = limb_cloexec_pipe(&descriptors) == 0
         wakeError = created ? nil : errno
         if !created { descriptors = [-1, -1] }
         #endif
@@ -672,7 +673,7 @@ private func runThread(_ context: UnsafeMutableRawPointer) {
     #else
     // A name is a convenience for whoever looks at the process; failing to set one is not
     // worth stopping for.
-    _ = pthread_setname_np(pthread_self(), start.name)
+    limb_name_current_thread(start.name)
     #endif
     start.body()
 }

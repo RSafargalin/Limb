@@ -17,6 +17,13 @@ let testSettings = importSettings
 let testSettings = settings
 #endif
 
+#if compiler(<6.4)
+// swift-crypto 5 uses compiler attributes unavailable in older toolchains.
+let cryptoVersions: Range<Version> = "3.0.0"..<"5.0.0"
+#else
+let cryptoVersions: Range<Version> = "3.0.0"..<"6.0.0"
+#endif
+
 let package = Package(
     name: "Limb",
     platforms: [
@@ -35,14 +42,14 @@ let package = Package(
                 """),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"6.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", cryptoVersions),
         // A wide range on purpose: other macro packages in a consumer's graph pin their own.
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"700.0.0"),
     ],
     targets: [
         // JSON, JSON-RPC, revisions, errors, framing, schema validation.
-        .target(name: "LimbCore", dependencies: [.target(name: "CLimbStack", condition: .when(platforms: [.linux]))], swiftSettings: settings),
-        .target(name: "CLimbStack"),
+        .target(name: "LimbCore", dependencies: [.target(name: "CLimbPosix", condition: .when(platforms: [.linux]))], swiftSettings: settings),
+        .target(name: "CLimbPosix"),
         // @Tool and @Schema. A compiler plugin: built for the build machine, never linked into the app.
         .macro(
             name: "LimbMacros",
@@ -64,7 +71,10 @@ let package = Package(
             ],
             swiftSettings: settings),
         // stdio transport: dedicated reader and writer threads.
-        .target(name: "LimbStdio", dependencies: ["LimbCore", "LimbServer"], swiftSettings: settings),
+        .target(
+            name: "LimbStdio",
+            dependencies: ["LimbCore", "LimbServer", .target(name: "CLimbPosix", condition: .when(platforms: [.linux]))],
+            swiftSettings: settings),
         // Umbrella: `import Limb`.
         .target(name: "Limb", dependencies: ["LimbCore", "LimbServer", "LimbStdio"], swiftSettings: settings),
         // In-memory harness for user tests.

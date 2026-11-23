@@ -6,7 +6,7 @@ import Glibc
 import Musl
 #endif
 #if os(Linux)
-import CLimbStack
+import CLimbPosix
 import CDispatch
 #endif
 
