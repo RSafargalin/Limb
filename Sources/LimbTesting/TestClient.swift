@@ -47,9 +47,6 @@ public final class TestClient: Sendable {
     private struct State {
         var nextID = 1
         var meta: JSONObject?
-        var log: [JSONValue] = []
-        /// What was wrong with a frame that `isSilent` received; the next read reports it.
-        var problem: TestClientError?
     }
 
     /// - Parameter modern: speak `2026-07-28` (per-request metadata) by default. Pass `false`
@@ -69,9 +66,9 @@ public final class TestClient: Sendable {
 
     /// Messages received that were not the response a `request` was waiting for: notifications
     /// and requests from the server, in arrival order.
-    public var received: [JSONValue] { state.withLock { $0.log } }
+    public var received: [JSONValue] { sink.received }
 
-    public func clearReceived() { state.withLock { $0.log = [] } }
+    public func clearReceived() { sink.clearReceived() }
 
     // MARK: Sending
 
@@ -113,22 +110,20 @@ public final class TestClient: Sendable {
 
     /// The next message from the server.
     public func next(timeout: Duration = .seconds(5)) async throws -> JSONValue {
-        if let problem = state.withLock({ state in defer { state.problem = nil }; return state.problem }) {
-            throw problem
-        }
-        guard let frame = await sink.next(timeout: timeout) else {
-            throw TestClientError(reason: "no message from the server within \(timeout)")
-        }
-        return try TestClient.check(frame)
+        try await receive(.next, timeout: timeout)
     }
 
-    /// Waits for the response to `id`. Other messages that arrive first are kept in `received`.
-    public func response(to id: RequestID, timeout: Duration = .seconds(5)) async throws -> JSONValue {
-        while true {
-            let message = try await next(timeout: timeout)
-            if message["method"] == nil, message["id"] == id.json { return message }
-            state.withLock { $0.log.append(message) }
+    private func receive(_ read: MemorySink.Read, timeout: Duration) async throws -> JSONValue {
+        guard let message = await sink.next(read, until: .now + timeout) else {
+            throw TestClientError(reason: "no message from the server within \(timeout)")
         }
+        return try message.get()
+    }
+
+    /// Waits up to `timeout` for the response to `id`. Notifications and server requests that
+    /// arrive first are kept in `received`. Other replies remain available by ID or through `next`.
+    public func response(to id: RequestID, timeout: Duration = .seconds(5)) async throws -> JSONValue {
+        try await receive(.response(id), timeout: timeout)
     }
 
     /// Sends a request and returns the full response message (with `result` or `error`).
@@ -144,35 +139,27 @@ public final class TestClient: Sendable {
     /// A message that arrives is kept in `received`. A frame that fails the checks is written to
     /// stderr, and the next `next`, `response` or `request` throws the same error.
     public func isSilent(for duration: Duration = .milliseconds(150)) async -> Bool {
-        guard let frame = await sink.next(timeout: duration) else { return true }
-        do {
-            let message = try TestClient.check(frame)
-            state.withLock { $0.log.append(message) }
-        } catch {
+        guard let frame = await sink.next(.observe, until: .now + duration) else { return true }
+        if case .failure(let error) = frame {
             ServerConfiguration.standardErrorDiagnostics("TestClient: \(error.reason)")
-            state.withLock { $0.problem = error }
         }
         return false
     }
 
     // MARK: Checking frames
 
-    private static func check(_ frame: MemorySink.Frame) throws(TestClientError) -> JSONValue {
-        let text = String(decoding: frame.bytes, as: UTF8.self)
-        if frame.arrivedAfterClose {
-            throw TestClientError(reason: "the server sent a frame after the connection was closed: \(text)")
-        }
-        guard !frame.bytes.contains(0x0A), !frame.bytes.contains(0x0D) else {
+    fileprivate static func check(_ bytes: [UInt8]) throws(TestClientError) -> JSONValue {
+        guard !bytes.contains(0x0A), !bytes.contains(0x0D) else {
             throw TestClientError(reason: "the server emitted a frame with an embedded line break")
         }
         let message: JSONValue
         do {
-            message = try JSON.parse(frame.bytes)
+            message = try JSON.parse(bytes)
         } catch {
-            throw TestClientError(reason: "the server emitted invalid JSON (\(error)): \(text)")
+            throw TestClientError(reason: "the server emitted invalid JSON (\(error)): \(String(decoding: bytes, as: UTF8.self))")
         }
         if let problem = envelopeProblem(message) {
-            throw TestClientError(reason: "the server emitted an invalid JSON-RPC message (\(problem)): \(text)")
+            throw TestClientError(reason: "the server emitted an invalid JSON-RPC message (\(problem)): \(String(decoding: bytes, as: UTF8.self))")
         }
         return message
     }
@@ -255,29 +242,110 @@ public final class TestClient: Sendable {
 /// A `FrameSink` that keeps frames in memory until the test reads them. See `TestClient` for
 /// how it differs from the transport's `OutboundQueue`.
 final class MemorySink: FrameSink {
-    struct Frame {
-        var bytes: [UInt8]
-        /// Refused because it came after `close`; kept so that the test hears of it.
-        var arrivedAfterClose: Bool
+    typealias Message = Result<JSONValue, TestClientError>
+
+    enum Read {
+        case next, response(RequestID), observe
     }
 
     private struct Entry {
-        var frame: Frame
+        enum Content {
+            case frame([UInt8], afterClose: Bool)
+            case decoded(Message)
+        }
+
+        var content: Content
         var key: RequestID?
+
+        mutating func decode() -> Message {
+            switch content {
+            case .decoded(let message): return message
+            case .frame(let frame, let afterClose):
+                let message = Message { () throws(TestClientError) in
+                    if afterClose {
+                        let text = String(decoding: frame, as: UTF8.self)
+                        throw TestClientError(reason: "the server sent a frame after the connection was closed: \(text)")
+                    }
+                    return try TestClient.check(frame)
+                }
+                content = .decoded(message)
+                return message
+            }
+        }
     }
 
     private struct State {
         var entries: [Entry] = []
         var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
         var nextWaiter = 0
+        var generation: UInt64 = 0
         var closed = false
+        var log: [JSONValue] = []
+        /// What was wrong with a frame that `isSilent` received; the next read reports it.
+        var problem: TestClientError?
+
+        mutating func take(_ read: Read) -> Message? {
+            switch read {
+            case .observe:
+                let message = takeFirst()
+                switch message {
+                case .success(let value): log.append(value)
+                case .failure(let error): problem = error
+                case nil: break
+                }
+                return message
+            case .next, .response:
+                if let problem {
+                    self.problem = nil
+                    return .failure(problem)
+                }
+                if case .response(let id) = read { return takeResponse(to: id) }
+                return takeFirst()
+            }
+        }
+
+        private mutating func takeFirst() -> Message? {
+            guard !entries.isEmpty else { return nil }
+            var entry = entries.removeFirst()
+            return entry.decode()
+        }
+
+        /// Observe notifications and requests in queue order. Compact the scanned prefix once
+        /// so any unrelated replies remain queued in their original order.
+        private mutating func takeResponse(to id: RequestID) -> Message? {
+            var kept = 0
+            var examined = 0
+            var selected: Message?
+            while examined < entries.count, selected == nil {
+                let message = entries[examined].decode()
+                switch message {
+                case .failure:
+                    selected = message
+                case .success(let value) where value["method"] != nil:
+                    log.append(value)
+                case .success(let value) where value["id"].flatMap(RequestID.init(json:)) == id:
+                    selected = message
+                case .success:
+                    if kept != examined { entries[kept] = entries[examined] }
+                    kept += 1
+                }
+                examined += 1
+            }
+            if kept != examined { entries.removeSubrange(kept..<examined) }
+            return selected
+        }
     }
 
     private let state = Mutex(State())
 
+    var received: [JSONValue] { state.withLock { $0.log } }
+
+    func clearReceived() { state.withLock { $0.log = [] } }
+
     func enqueue(_ frame: [UInt8], key: RequestID?, urgent: Bool, replacesProgress: Bool) -> Bool {
         let (accepted, waiters): (Bool, [CheckedContinuation<Void, Never>]) = state.withLock { state in
-            state.entries.append(Entry(frame: Frame(bytes: frame, arrivedAfterClose: state.closed), key: key))
+            state.entries.append(Entry(content: .frame(frame, afterClose: state.closed), key: key))
+            state.generation &+= 1
             let waiters = Array(state.waiters.values)
             state.waiters = [:]
             return (!state.closed, waiters)
@@ -296,20 +364,27 @@ final class MemorySink: FrameSink {
         state.withLock { $0.closed = true }
     }
 
-    func next(timeout: Duration) async -> Frame? {
-        let deadline = ContinuousClock.now + timeout
-        while true {
-            let (frame, token): (Frame?, Int) = state.withLock { state in
-                if !state.entries.isEmpty { return (state.entries.removeFirst().frame, 0) }
+    func next(_ read: Read, until deadline: ContinuousClock.Instant) async -> Message? {
+        repeat {
+            let (message, token, generation): (Message?, Int, UInt64) = state.withLock { state in
+                if Task.isCancelled { return (nil, 0, 0) }
+                if let message = state.take(read) { return (message, 0, 0) }
                 state.nextWaiter += 1
-                return (nil, state.nextWaiter)
+                return (nil, state.nextWaiter, state.generation)
             }
-            if let frame { return frame }
-            guard ContinuousClock.now < deadline else { return nil }
+            if let message { return message }
+            guard !Task.isCancelled, ContinuousClock.now < deadline else { return nil }
+            await waitForEnqueue(since: generation, token: token, until: deadline)
+        } while !Task.isCancelled && ContinuousClock.now < deadline
+        return nil
+    }
+
+    private func waitForEnqueue(since generation: UInt64, token: Int, until deadline: ContinuousClock.Instant) async {
+        await withTaskCancellationHandler {
             var timer: Task<Void, Never>?
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 let ready = state.withLock { state in
-                    if !state.entries.isEmpty { return true }
+                    if Task.isCancelled || generation != state.generation { return true }
                     state.waiters[token] = continuation
                     return false
                 }
@@ -325,6 +400,8 @@ final class MemorySink: FrameSink {
                 }
             }
             timer?.cancel()
+        } onCancel: {
+            state.withLock { $0.waiters.removeValue(forKey: token) }?.resume()
         }
     }
 }
