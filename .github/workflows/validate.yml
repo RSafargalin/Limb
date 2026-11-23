@@ -19,13 +19,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-26, ubuntu-24.04]
-        swift: ['6.2.0', '6.4.3']
+        swift: ['6.2', '6.4.3']
         codec: [default, FoundationJSON]
     env:
       LIMB_CI_CODEC: ${{ matrix.codec }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - uses: swift-actions/setup-swift@364295d9c23900ce04d4e5cc708387921b4e50f9 # v3
+      - uses: tryswift/setup-swift@ce5fe39afee72fd792fabab6db8ec3005962daf7 # v1
         with:
           swift-version: ${{ matrix.swift }}
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
