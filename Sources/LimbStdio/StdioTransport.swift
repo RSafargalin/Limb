@@ -466,13 +466,13 @@ final class StdioSession: Sendable {
                 var deadline = started + limit
                 while true {
                     guard (try? await Task.sleep(until: deadline, clock: .continuous)) != nil else { return }
-                    // With nothing left to write the writer is about to see the closed, empty
-                    // queue and end. It is not standing still, however long it takes to notice.
-                    let usage = queue.usage
-                    if usage.ordinaryBytes == 0, usage.urgentBytes == 0 { return }
                     var next: ContinuousClock.Instant?
                     let waiter: CheckedContinuation<Void, Never>? = completion.withLock { state in
                         guard !state.writerFinishing else { return nil }
+                        // Read the queue under the same lock as frameFinished. When no frame
+                        // remains, just wait for the writer to notice the closed queue.
+                        let usage = queue.usage
+                        guard usage.ordinaryBytes != 0 || usage.urgentBytes != 0 else { return nil }
                         let idleSince = Swift.max(state.lastProgress, started)
                         if ContinuousClock.now - idleSince < limit {
                             next = idleSince + limit
@@ -482,7 +482,7 @@ final class StdioSession: Sendable {
                         // A settled frame still counted by the queue can itself have filled
                         // the last buffer. Only probe if there is more work to write. The
                         // writer takes this same lock before closing its duplicate.
-                        if output >= 0, !state.frameFinished || queue.usage.queuedFrames > 0 {
+                        if output >= 0, !state.frameFinished || usage.queuedFrames > 0 {
                             var descriptor = pollfd(fd: output, events: Int16(POLLOUT), revents: 0)
                             state.backpressuredAtDeadline = poll(&descriptor, 1, 0) == 0
                         }
@@ -712,8 +712,8 @@ final class StdioSession: Sendable {
             }
             guard offset > 0 else { return true }
         }
-        return writeAll(bytes, from: offset, writingTo: writerOutput) &&
-            (appendedNewline || writeAll([0x0A], writingTo: writerOutput))
+        return writeAll(bytes, from: offset, writingTo: writerOutput, finishesFrame: appendedNewline) &&
+            (appendedNewline || writeAll([0x0A], writingTo: writerOutput, finishesFrame: true))
     }
 
     private func reportWriteFailure(_ error: Int32) {
@@ -731,7 +731,9 @@ final class StdioSession: Sendable {
     /// one that has stopped. The drain timer measures successful writes. Once draining begins,
     /// each new write uses at most 1 KiB, while an earlier write can still be up to 16 KiB.
     /// The kernel can free buffer space in larger units, such as pages for a Linux pipe.
-    private func writeAll(_ bytes: [UInt8], from start: Int = 0, writingTo writerOutput: StdioWriterOutput) -> Bool {
+    private func writeAll(
+        _ bytes: [UInt8], from start: Int = 0, writingTo writerOutput: StdioWriterOutput, finishesFrame: Bool
+    ) -> Bool {
         return bytes.withUnsafeBytes { raw in
             var offset = start
             while offset < raw.count {
@@ -742,7 +744,10 @@ final class StdioSession: Sendable {
                 let written = writerOutput.write(raw.baseAddress! + offset, count: Swift.min(raw.count - offset, pieceSize))
                 if written > 0 {
                     offset += written
-                    completion.withLock { $0.lastProgress = ContinuousClock.now }
+                    completion.withLock { state in
+                        state.lastProgress = ContinuousClock.now
+                        if finishesFrame, offset == raw.count { state.frameFinished = true }
+                    }
                     continue
                 }
                 if written == 0 {
