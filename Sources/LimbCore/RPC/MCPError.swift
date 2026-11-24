@@ -44,6 +44,8 @@ extension MCPError {
         public static let responseTooLarge = -31002
         /// A request this server sent to the client went unanswered for too long.
         public static let requestTimedOut = -31003
+        /// The transport refused a request destined for the client.
+        public static let requestDeliveryFailed = -31004
     }
 
     public static func parseError(_ detail: String) -> MCPError {
@@ -98,6 +100,10 @@ extension MCPError {
 
     public static func requestTimedOut(method: String, seconds: Double) -> MCPError {
         MCPError(code: Code.requestTimedOut, message: "The client did not answer \(method) within \(seconds) seconds")
+    }
+
+    public static func requestDeliveryFailed(method: String) -> MCPError {
+        MCPError(code: Code.requestDeliveryFailed, message: "Could not send \(method) to the client")
     }
 
     /// `URLElicitationRequiredError` (`2025-11-25`): the request cannot be served until the user

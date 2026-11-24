@@ -1,4 +1,5 @@
 public import LimbCore
+import Foundation
 import Synchronization
 
 /// Everything a handler knows about the request it is serving, and its way to talk back
@@ -21,6 +22,7 @@ public final class RequestContext: Sendable {
     let serial: UInt64
     let progressToken: JSONValue?
     let logLevel: LoggingLevel?
+    let legacySession: LegacySessionIdentity?
     let inputState: InputState
 
     init(
@@ -36,6 +38,7 @@ public final class RequestContext: Sendable {
         self.connection = connection
         self.serial = serial
         logLevel = peer.logLevel
+        legacySession = peer.legacySession
         self.inputState = inputState
         // A progress token is a string or an integer; anything else is ignored.
         switch meta[MetaKey.progressToken] {
@@ -106,6 +109,8 @@ public final class RequestContext: Sendable {
     /// be asked for again: in `2026-07-28` the second question would receive the first one's
     /// answer, so it is an error in every revision. A question that got no answer (one that
     /// timed out) may be asked again.
+    /// An answer accepted in an earlier round stays associated with its key until the operation
+    /// ends, even if a later run does not read it. Use a new key when asking a different question.
     ///
     /// In legacy revisions a request the client leaves unanswered for
     /// `ServerConfiguration.clientRequestTimeoutSeconds` is withdrawn, and this call throws
@@ -114,6 +119,7 @@ public final class RequestContext: Sendable {
         guard inputState.allowed else {
             throw MCPError.internalError("\(method) cannot request additional input")
         }
+        let formValidators = try elicitationValidators(for: requests)
         let keys = requests.map(\.key)
         try inputState.reserve(keys)
         for (_, request) in requests {
@@ -129,7 +135,9 @@ public final class RequestContext: Sendable {
         }
         if profile.multiRoundTrip {
             do {
-                return try inputState.resolve(requests)
+                return try inputState.resolve(requests) { key, answer throws(MCPError) in
+                    try validateFormAnswer(answer, for: key, using: formValidators[key])
+                }
             } catch let signal as InputRequiredSignal {
                 // The run ends here. Throwing cannot force that — the handler may catch the
                 // error — so the handler's task is cancelled as well, and from now on nothing
@@ -140,15 +148,18 @@ public final class RequestContext: Sendable {
         }
         return try await withThrowingTaskGroup(of: (String, InputResponse).self) { group in
             for (key, request) in requests {
-                group.addTask { [connection, profile, requestID, serial, inputState] in
+                group.addTask { [self] in
                     do {
                         let reply = try await connection.requestClient(
-                            request, profile: profile, caller: (id: requestID, serial: serial))
+                            request, profile: profile, legacySession: legacySession, caller: (id: requestID, serial: serial))
+                        let answer: InputResponse
                         do {
-                            return (key, try InputResponse(json: reply, for: request))
+                            answer = try InputResponse(json: reply, for: request)
                         } catch {
                             throw MCPError.internalError("the client's reply to \(request.method) is malformed: \(error)")
                         }
+                        try validateFormAnswer(answer, for: key, using: formValidators[key])
+                        return (key, answer)
                     } catch {
                         // No answer: the question may be asked again.
                         inputState.release([key])
@@ -167,19 +178,8 @@ public final class RequestContext: Sendable {
     /// The content of an accepted answer comes from the client; it is checked against `schema`
     /// before it is returned, and an answer that does not match is an error, never data.
     public func elicit(_ key: String, message: String, schema: JSONObject) async throws -> ElicitResult {
-        let validator: JSONSchema
-        do {
-            validator = try JSONSchema(.object(schema))
-        } catch {
-            throw MCPError.internalError("the requested schema of \"\(key)\" cannot be enforced: \(error)")
-        }
         let answers = try await input([key: .elicit(ElicitRequest(message: message, requestedSchema: schema))])
         guard case .elicit(let result) = answers[key] else { throw MCPError.internalError("missing answer for \(key)") }
-        if result.action == .accept, let violation = validator.validate(.object(result.content ?? JSONObject())) {
-            let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(violation)"
-            // In 2026-07-28 the answer arrived in this request's own params.
-            throw profile.multiRoundTrip ? MCPError.invalidParams(detail) : MCPError.internalError(detail)
-        }
         return result
     }
 
@@ -218,6 +218,101 @@ public final class RequestContext: Sendable {
         let answers = try await input([key: .roots])
         guard case .roots(let result) = answers[key] else { throw MCPError.internalError("missing answer for \(key)") }
         return result
+    }
+
+    private func elicitationValidators(for requests: KeyValuePairs<String, InputRequest>) throws(MCPError) -> [String: JSONSchema] {
+        var validators: [String: JSONSchema] = [:]
+        for (key, request) in requests {
+            guard case .elicit(let elicitation) = request else { continue }
+            switch elicitation.mode {
+            case .form(let schema):
+                guard schema["type"] == "object",
+                    schema.allSatisfy({ ["$schema", "type", "properties", "required"].contains($0.key) }),
+                    let fields = (schema["properties"] ?? [:]).objectValue,
+                    (schema["required"]?.arrayValue ?? []).allSatisfy({ $0.stringValue.map(fields.contains) == true }),
+                    fields.allSatisfy({ entry in entry.value.objectValue.map(isElicitationField) == true })
+                else {
+                    throw .internalError("the requested schema of \"\(key)\" must be a flat elicitation form")
+                }
+                do {
+                    validators[key] = try JSONSchema(.object(schema))
+                } catch {
+                    throw .internalError("the requested schema of \"\(key)\" cannot be enforced: \(error)")
+                }
+            case .url(let url):
+                guard let parsed = URL(string: url, encodingInvalidCharacters: false), let scheme = parsed.scheme,
+                    !["http", "https"].contains(scheme.lowercased()) || parsed.host?.isEmpty == false
+                else {
+                    throw .internalError("the URL for elicitation \"\(key)\" must be absolute")
+                }
+            }
+        }
+        return validators
+    }
+
+    private func isElicitationField(_ field: JSONObject) -> Bool {
+        func uses(_ object: JSONObject, _ keywords: Set<String>) -> Bool {
+            object.allSatisfy { keywords.contains($0.key) }
+        }
+        func strings(_ value: JSONValue?) -> Bool {
+            guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
+            return choices.allSatisfy { $0.stringValue != nil }
+        }
+        if let value = field["default"] {
+            let matches: Bool
+            switch (field["type"]?.stringValue, value) {
+            case ("string", .string), ("number", .number), ("boolean", .bool): matches = true
+            case ("integer", .number(let number)): matches = number.isInteger
+            case ("array", .array(let values)): matches = values.allSatisfy { $0.stringValue != nil }
+            default: matches = false
+            }
+            guard matches else { return false }
+        }
+        func titledChoices(_ value: JSONValue?) -> Bool {
+            guard let choices = value?.arrayValue, !choices.isEmpty else { return false }
+            return choices.allSatisfy {
+                guard let choice = $0.objectValue, uses(choice, ["const", "title"]) else { return false }
+                return choice["const"]?.stringValue != nil && choice["title"]?.stringValue != nil
+            }
+        }
+        let common: Set<String> = ["type", "title", "description", "default"]
+        switch field["type"]?.stringValue {
+        case "string":
+            if let format = field["format"], !["email", "uri", "date", "date-time"].contains(format.stringValue ?? "") { return false }
+            if let choices = field["oneOf"] {
+                return profile.urlElicitation && uses(field, common.union(["oneOf"])) && titledChoices(choices)
+            }
+            if let choices = field["enum"] {
+                return uses(field, common.union(["enum", "enumNames"])) && strings(choices)
+                    && (field["enumNames"] == nil || strings(field["enumNames"]))
+            }
+            return uses(field, common.union(["minLength", "maxLength", "format"]))
+        case "number", "integer": return uses(field, common.union(["minimum", "maximum"]))
+        case "boolean": return uses(field, common)
+        case "array":
+            guard profile.urlElicitation, uses(field, common.union(["items", "minItems", "maxItems"])),
+                let items = field["items"]?.objectValue else { return false }
+            if items["type"] == "string" { return uses(items, ["type", "enum"]) && strings(items["enum"]) }
+            return uses(items, ["anyOf"]) && titledChoices(items["anyOf"])
+        default: return false
+        }
+    }
+
+    private func validateFormAnswer(_ answer: InputResponse, for key: String, using validator: JSONSchema?) throws(MCPError) {
+        guard let validator, case .elicit(let result) = answer, result.action == .accept else { return }
+        func invalid(_ reason: String) -> MCPError {
+            let detail = "the client's answer to \"\(key)\" does not match the requested schema: \(reason)"
+            return profile.multiRoundTrip ? .invalidParams(detail) : .internalError(detail)
+        }
+        guard let content = result.content else { throw invalid("form acceptance requires content") }
+        for (_, value) in content {
+            switch value {
+            case .string, .number, .bool: break
+            case .array(let values) where profile.urlElicitation && values.allSatisfy({ $0.stringValue != nil }): break
+            default: throw invalid("form values must be primitives or supported string arrays")
+            }
+        }
+        if let violation = validator.validate(.object(content)) { throw invalid(violation.description) }
     }
 
     /// The capability `request` needs, if the client did not declare it or the revision lacks it.
@@ -260,6 +355,7 @@ final class InputState: Sendable {
     /// Answers available to this run: earlier rounds' (from `requestState`) and this round's.
     let answers: JSONObject
     let fingerprint: String
+    let version: RequestStatePayload.Version
 
     private struct Progress {
         /// Requests the handler asked for and has no answer to.
@@ -278,10 +374,15 @@ final class InputState: Sendable {
 
     private let progress = Mutex(Progress())
 
-    init(allowed: Bool, answers: JSONObject = JSONObject(), fingerprint: String = "") {
+    init(
+        allowed: Bool, answers: JSONObject = JSONObject(), journal: JSONObject = JSONObject(), fingerprint: String = "",
+        version: RequestStatePayload.Version = .exact
+    ) {
         self.allowed = allowed
         self.answers = answers
         self.fingerprint = fingerprint
+        self.version = version
+        progress.withLock { $0.journal = journal }
     }
 
     static let unavailable = InputState(allowed: false)
@@ -314,7 +415,9 @@ final class InputState: Sendable {
         error.code == MCPError.Code.missingRequiredClientCapability && progress.withLock { $0.missingCapabilityErrors.contains(error) }
     }
 
-    func resolve(_ requests: KeyValuePairs<String, InputRequest>) throws -> [String: InputResponse] {
+    func resolve(
+        _ requests: KeyValuePairs<String, InputRequest>, validate: (String, InputResponse) throws(MCPError) -> Void
+    ) throws -> [String: InputResponse] {
         var resolved: [String: InputResponse] = [:]
         var missing: [(key: String, request: InputRequest)] = []
         for (key, request) in requests {
@@ -322,11 +425,14 @@ final class InputState: Sendable {
                 missing.append((key, request))
                 continue
             }
+            let answer: InputResponse
             do {
-                resolved[key] = try InputResponse(json: raw, for: request)
+                answer = try InputResponse(json: raw, for: request)
             } catch {
                 throw MCPError.invalidParams("inputResponses.\(key): \(error)")
             }
+            try validate(key, answer)
+            resolved[key] = answer
         }
         progress.withLock { progress in
             for (key, _) in requests {
@@ -350,6 +456,8 @@ final class InputState: Sendable {
 }
 
 /// The era and identity a request is served under.
+final class LegacySessionIdentity: Sendable {}
+
 struct Peer: Sendable {
     let profile: RevisionProfile
     let capabilities: ClientCapabilities
@@ -357,4 +465,5 @@ struct Peer: Sendable {
     /// Minimum level for `notifications/message` on this request; `nil` sends none.
     let logLevel: LoggingLevel?
     var negotiatedServerCapabilities: Set<ServerCapability> = []
+    var legacySession: LegacySessionIdentity? = nil
 }

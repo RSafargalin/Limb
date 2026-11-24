@@ -27,12 +27,14 @@ public final class Connection: Sendable {
     let server: Server
     let sink: any FrameSink
     private let configuration: ServerConfiguration
+    private let authenticatedPrincipal: String?
     private let state = Mutex(State())
 
-    init(server: Server, sink: any FrameSink) {
+    init(server: Server, sink: any FrameSink, authenticatedPrincipal: String?) {
         self.server = server
         self.sink = sink
         configuration = server.configuration
+        self.authenticatedPrincipal = authenticatedPrincipal
     }
 
 
@@ -45,6 +47,7 @@ public final class Connection: Sendable {
     // MARK: State
 
     private struct LegacySession: Sendable {
+        let identity = LegacySessionIdentity()
         var profile: RevisionProfile
         var capabilities: ClientCapabilities
         var clientInfo: Implementation
@@ -111,7 +114,7 @@ public final class Connection: Sendable {
         /// The peer is gone: a grace period, under way or to come, is over.
         var graceEnded = false
         /// The wait of `close` for requests in flight, which `endGracePeriod` cuts short.
-        var graceWaiter: Int?
+        var graceWaiters: Set<Int> = []
         var oversizedFrames = 0
         var overflowed = false
         var reportedDroppedLogs = false
@@ -124,9 +127,11 @@ public final class Connection: Sendable {
         var subscribedResourceBytes = 0
         /// Events that arrived while the peer was not reading. Each is kept once and sent when
         /// there is room again: "the list changed" said once is as good as said a thousand times.
-        var deferredEvents: [ServerEvent] = []
-        var deferredKeys: Set<EventKey> = []
-        var flushingDeferredEvents = false
+        var deferredEvents: [DeferredEvent?] = []
+        var deferredHead = 0
+        var deferredIndices: [EventKey: Int] = [:]
+        var activeDelivery: EventDelivery?
+        var flushTask: Task<Void, Never>?
     }
 
     // MARK: Receiving
@@ -134,6 +139,10 @@ public final class Connection: Sendable {
     /// Handles one frame. Call from a single reader, in arrival order; returns before any
     /// handler has run.
     public func receive(_ frame: Span<UInt8>) {
+        guard frame.count <= configuration.budgets.maxFrameBytes else {
+            _ = receivedOversizedFrame()
+            return
+        }
         let value: JSONValue
         do {
             value = try JSON.parse(frame, options: configuration.parseOptions)
@@ -142,7 +151,7 @@ public final class Connection: Sendable {
             return
         }
         if case .array(let items) = value {
-            receiveBatch(items, bytes: frame.count)
+            receiveBatch(items)
         } else {
             dispatch(value, responder: .direct, bytes: frame.count)
         }
@@ -156,7 +165,7 @@ public final class Connection: Sendable {
     /// should be dropped: a second oversized frame is not an accident.
     public func receivedOversizedFrame() -> Bool {
         let count = state.withLock { state in
-            state.oversizedFrames += 1
+            state.oversizedFrames = min(2, state.oversizedFrames + 1)
             return state.oversizedFrames
         }
         sendFromReader(
@@ -168,7 +177,7 @@ public final class Connection: Sendable {
     /// should stop reading and close.
     public var hasOverflowed: Bool { state.withLock { $0.overflowed } }
 
-    private func receiveBatch(_ items: [JSONValue], bytes: Int) {
+    private func receiveBatch(_ items: [JSONValue]) {
         // Batches exist only in 2025-03-26, which makes them mandatory; later revisions removed them.
         guard let legacy = state.withLock({ $0.legacy }), legacy.profile.acceptsBatch else {
             sendFromReader(Frame.error(id: nil, .invalidRequest("JSON-RPC batches are not supported by this protocol revision")))
@@ -198,18 +207,20 @@ public final class Connection: Sendable {
         }
         guard expecting.contains(true) else {
             // Nothing in the batch calls for an answer, so there is no reply at all.
-            for item in items { dispatch(item, responder: .direct, bytes: bytes / items.count) }
+            for item in items { dispatch(item, responder: .direct, bytes: 0) }
             return
         }
-        let collector = BatchCollector(slots: expecting.count { $0 })
+        let collector = BatchCollector(slots: expecting.count { $0 }, budget: server.batchReplyBudget)
         var slot = 0
-        let share = bytes / items.count
         for (index, item) in items.enumerated() {
             if expecting[index] {
-                dispatch(item, responder: .batch(collector, slot), bytes: share)
+                // The scheduler retains this member independently of its siblings.
+                var writer = JSONWriter()
+                writer.write(item)
+                dispatch(item, responder: .batch(collector, slot), bytes: writer.bytes.count)
                 slot += 1
             } else {
-                dispatch(item, responder: .direct, bytes: share)
+                dispatch(item, responder: .direct, bytes: 0)
             }
         }
     }
@@ -227,7 +238,9 @@ public final class Connection: Sendable {
                 if let id = error.id { _ = failClientRequest(id, .internalError("the peer sent a malformed response")) }
                 report(.malformedReply, "ignored a malformed reply: \(error.error.message)")
                 respondWithNothing(responder)
-            } else if let id = error.id, failClientRequest(id, .internalError("the peer sent a malformed response")) {
+            } else if error.isAmbiguous, let id = error.id,
+                failClientRequest(id, .internalError("the peer sent a malformed response"))
+            {
                 // The id names a request this side sent, so the message is a reply to it, however
                 // broken. Answering it would put a stray response under one of the peer's own ids.
                 report(.malformedReply, "ignored a malformed reply to request \(peerText(id.description)): \(error.error.message)")
@@ -293,7 +306,7 @@ public final class Connection: Sendable {
         if let legacy = state.withLock({ $0.legacy }) {
             return Peer(
                 profile: legacy.profile, capabilities: legacy.capabilities, clientInfo: legacy.clientInfo,
-                logLevel: nil, negotiatedServerCapabilities: legacy.negotiated)
+                logLevel: nil, negotiatedServerCapabilities: legacy.negotiated, legacySession: legacy.identity)
         }
         if method == "ping", let version = configuration.legacyVersions.max(),
             let profile = RevisionProfile.profile(for: version)
@@ -403,6 +416,10 @@ public final class Connection: Sendable {
             return
         }
         if method == "initialize" {
+            if case .batch = responder {
+                respond(Frame.error(id: id, .invalidRequest("initialize must be sent on its own")), id: id, responder)
+                return
+            }
             initialize(id: id, params: params, responder: responder)
             return
         }
@@ -692,31 +709,30 @@ public final class Connection: Sendable {
         let uri: String
         do { uri = try params.required("uri") } catch { throw MCPError.invalidParams(error) }
         let registry = server.snapshot
-        let read: ResourceReader
-        var variables: [String: String] = [:]
-        var cache = configuration.resourceCache
-        if let resource = registry.resource(uri: uri) {
-            read = resource.read
-            cache = resource.cache ?? cache
-        } else {
-            var matched: TemplateEntry?
-            for template in registry.contents.templates {
-                if let found = template.template.match(uri) {
-                    matched = template
-                    variables = found
-                    break
+        let isContinuation = peer.profile.multiRoundTrip && (params.contains("requestState") || params.contains("inputResponses"))
+        admit(id: id, method: "resources/read", detail: uri, bytes: bytes, responder: responder) { [self] serial in
+            let read: ResourceReader
+            let variables: [String: String]
+            let cache: CachePolicy?
+            if let resource = registry.resource(uri: uri) {
+                read = resource.read
+                cache = resource.cache
+                variables = [:]
+            } else {
+                do throws(MCPError) {
+                    guard let (template, matches) = try matchTemplate(uri, in: registry.contents.templates) else {
+                        return Frame.error(id: id, MCPError(
+                            code: peer.profile.resourceNotFoundCode, message: "Resource not found", data: ["uri": .string(uri)]))
+                    }
+                    read = template.read
+                    cache = template.cache
+                    variables = matches
+                } catch {
+                    return Frame.error(id: id, error)
                 }
             }
-            guard let matched else {
-                // -32002 until 2025-11-25, -32602 from 2026-07-28: the code is a cell of the matrix.
-                throw MCPError(code: peer.profile.resourceNotFoundCode, message: "Resource not found", data: ["uri": .string(uri)])
-            }
-            read = matched.read
-            cache = matched.cache ?? cache
-        }
-        let request = ResourceRequest(uri: uri, variables: variables)
-        let policy = cache
-        admit(id: id, method: "resources/read", detail: uri, bytes: bytes, responder: responder) { [self] serial in
+            let request = ResourceRequest(uri: uri, variables: variables)
+            let policy = isContinuation ? CachePolicy(ttlMilliseconds: 0, scope: .private) : cache ?? configuration.resourceCache
             let input: InputState
             do throws(MCPError) {
                 input = try makeInputState(method: "resources/read", target: uri, arguments: .null, params: params, peer: peer)
@@ -744,6 +760,27 @@ public final class Connection: Sendable {
                 }
             }
         }
+    }
+
+    private func matchTemplate(
+        _ uri: String, in templates: [TemplateEntry], preferExactName: Bool = false
+    ) throws(MCPError) -> (TemplateEntry, [String: String])? {
+        guard uri.utf8.count <= URITemplate.maxURIBytes else { return nil }
+        var budget = URITemplate.matchingWorkLimit
+        if preferExactName {
+            let uriCount = uri.utf8.count
+            for template in templates {
+                let name = template.definition.uriTemplate
+                budget -= 1 + min(uriCount, name.utf8.count)
+                guard budget >= 0 else { throw MCPError.overloaded("resource template matching work limit exceeded") }
+                if name.isBytewiseEqual(to: uri) { return (template, [:]) }
+            }
+        }
+        let bytes = Array(uri.utf8)
+        for template in templates {
+            if let variables = try template.template.match(bytes, budget: &budget) { return (template, variables) }
+        }
+        return nil
     }
 
     private func getPrompt(
@@ -827,22 +864,21 @@ public final class Connection: Sendable {
             let value = argument["value"]?.stringValue
         else { throw MCPError.invalidParams("argument: expected an object with string \"name\" and \"value\"") }
         let registry = server.snapshot
-        let handler: CompletionHandler?
+        let target: String
         switch kind {
         case "ref/prompt":
             guard let name = reference["name"]?.stringValue, let prompt = registry.prompt(named: name) else {
                 throw MCPError.invalidParams("ref: unknown prompt")
             }
-            handler = prompt.complete
+            if prompt.complete == nil {
+                // There is no user code to schedule for this answer.
+                respond(completionFrame(id: id, peer: peer, CompletionResult(hasMore: false)), id: id, responder)
+                return
+            }
+            target = name
         case "ref/resource":
             guard let uri = reference["uri"]?.stringValue else { throw MCPError.invalidParams("ref.uri: missing required field") }
-            // The template named exactly wins over one that merely matches the text of its name.
-            let templates = registry.contents.templates
-            guard
-                let template = templates.first(where: { $0.definition.uriTemplate.isBytewiseEqual(to: uri) })
-                    ?? templates.first(where: { $0.template.match(uri) != nil })
-            else { throw MCPError.invalidParams("ref: unknown resource template") }
-            handler = template.complete
+            target = uri
         default:
             throw MCPError.invalidParams("ref.type: expected \"ref/prompt\" or \"ref/resource\"")
         }
@@ -850,38 +886,42 @@ public final class Connection: Sendable {
         if case .object(let object) = params["context"]?["arguments"] {
             for (key, value) in object { resolved[key] = value.stringValue }
         }
-        guard let handler else {
-            // Nothing to suggest is a valid answer.
-            let frame = resultFrame(id: id, peer: peer) { writer in
-                writer.key("completion")
-                writer.beginObject()
-                writer.field("values", [String]())
-                writer.field("hasMore", false)
-                writer.endObject()
-            }
-            respond(frame, id: id, responder)
-            return
-        }
         let request = CompletionRequest(argumentName: argumentName, value: value, resolvedArguments: resolved)
         admit(id: id, method: "completion/complete", detail: argumentName, bytes: bytes, responder: responder) { [self] serial in
+            let handler: CompletionHandler?
+            if kind == "ref/prompt" {
+                handler = registry.prompt(named: target)?.complete
+            } else {
+                do throws(MCPError) {
+                    guard let (template, _) = try matchTemplate(target, in: registry.contents.templates, preferExactName: true) else {
+                        return Frame.error(id: id, .invalidParams("ref: unknown resource template"))
+                    }
+                    handler = template.complete
+                } catch {
+                    return Frame.error(id: id, error)
+                }
+            }
             let context = RequestContext(
                 requestID: id, method: "completion/complete", peer: peer, meta: meta, connection: self,
                 serial: serial, inputState: .unavailable)
             do {
-                let result = try await handler(request, context)
-                return resultFrame(id: id, peer: peer) { writer in
-                    writer.key("completion")
-                    writer.beginObject()
-                    // The specification caps a completion at 100 values.
-                    writer.field("values", Array(result.values.prefix(100)))
-                    writer.field("total", result.total)
-                    // Values were dropped to fit the cap, so there are more, whatever the handler said.
-                    writer.field("hasMore", result.values.count > 100 ? true : result.hasMore)
-                    writer.endObject()
-                }
+                let result = try await handler?(request, context) ?? CompletionResult(hasMore: false)
+                return completionFrame(id: id, peer: peer, result)
             } catch {
                 return failureFrame(id: id, error, peer: peer, context: context, isTool: false)
             }
+        }
+    }
+
+    private func completionFrame(id: RequestID, peer: Peer, _ result: CompletionResult) -> [UInt8] {
+        resultFrame(id: id, peer: peer) { writer in
+            writer.key("completion")
+            writer.beginObject()
+            // The specification caps a completion at 100 values.
+            writer.field("values", Array(result.values.prefix(100)))
+            writer.field("total", result.total)
+            writer.field("hasMore", result.values.count > 100 ? true : result.hasMore)
+            writer.endObject()
         }
     }
 
@@ -979,32 +1019,42 @@ public final class Connection: Sendable {
         method: String, target: String, arguments: JSONValue, params: JSONObject, peer: Peer
     ) throws(MCPError) -> InputState {
         guard peer.profile.multiRoundTrip else { return InputState(allowed: true) }
-        var answers = JSONObject()
+        var journal = JSONObject()
         // Checked before anything is merged: only the keys the handler asks for matter, and a
         // handler asks for a handful.
         let limit = configuration.budgets.maxInputResponses
         if case .object(let responses) = params["inputResponses"], responses.count > limit {
             throw MCPError.invalidParams("inputResponses: more than \(limit) entries")
         }
-        let fingerprint = requestFingerprint(method: method, target: target, arguments: arguments)
-        if let stateValue = params["requestState"], !stateValue.isNull {
+        let version: RequestStatePayload.Version = authenticatedPrincipal == nil ? .exact : .principalBound
+        let fingerprint = requestFingerprint(method: method, target: target, arguments: arguments, version: version,
+            principal: authenticatedPrincipal)
+        if let stateValue = params["requestState"] {
             // The state came back through the client: verify before anything reads it.
             guard let sealed = stateValue.stringValue else { throw MCPError.invalidParams("requestState: expected string") }
             guard let opened = try? server.sealer.open(sealed), let payload = RequestStatePayload(opened) else {
                 throw MCPError.invalidParams("requestState: failed verification")
             }
-            guard payload.expires >= unixTime() else { throw MCPError.invalidParams("requestState: expired") }
-            guard payload.fingerprint == fingerprint else {
+            guard payload.expires > unixTime() else { throw MCPError.invalidParams("requestState: expired") }
+            guard (payload.version == .principalBound) == (version == .principalBound) else {
                 throw MCPError.invalidParams("requestState: issued for a different request")
             }
-            answers = payload.journal
+            let expected = payload.version == .legacy
+                ? requestFingerprint(method: method, target: target, arguments: arguments, version: .legacy)
+                : fingerprint
+            guard payload.fingerprint == expected else {
+                throw MCPError.invalidParams("requestState: issued for a different request")
+            }
+            journal = payload.journal
         }
+        var answers = journal
         switch params["inputResponses"] {
-        case .none, .some(.null): break
-        case .some(.object(let responses)): answers = answers.merging(responses)
+        case .none: break
+        case .some(.object(let responses)):
+            for (key, answer) in responses where answers[key] == nil { answers[key] = answer }
         case .some(let other): throw MCPError.invalidParams("inputResponses: expected object, got \(other.typeName)")
         }
-        return InputState(allowed: true, answers: answers, fingerprint: fingerprint)
+        return InputState(allowed: true, answers: answers, journal: journal, fingerprint: fingerprint, version: version)
     }
 
     /// If the run asked for input it did not have, the response is an `InputRequiredResult`,
@@ -1025,7 +1075,7 @@ public final class Connection: Sendable {
         let (expires, overflow) = unixTime().addingReportingOverflow(configuration.requestStateLifetimeSeconds)
         let payload = RequestStatePayload(
             expires: overflow ? .max : expires,
-            fingerprint: context.inputState.fingerprint, journal: outstanding.journal)
+            fingerprint: context.inputState.fingerprint, journal: outstanding.journal, version: context.inputState.version)
         let plaintext = payload.encoded()
         guard plaintext.count <= configuration.maxRequestStateBytes else {
             // Earlier answers travel in the state; past the limit they are not carried further.
@@ -1063,7 +1113,8 @@ public final class Connection: Sendable {
     /// A request the client leaves unanswered for `clientRequestTimeoutSeconds` is withdrawn,
     /// as the specification recommends, and the call throws `MCPError.requestTimedOut`.
     func requestClient(
-        _ request: InputRequest, profile: RevisionProfile, caller: (id: RequestID, serial: UInt64)
+        _ request: InputRequest, profile: RevisionProfile, legacySession: LegacySessionIdentity?,
+        caller: (id: RequestID, serial: UInt64)
     ) async throws -> JSONValue {
         let number = state.withLock { state in
             defer { state.nextClientRequest += 1 }
@@ -1090,8 +1141,16 @@ public final class Connection: Sendable {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
+                    guard state.legacy?.identity === legacySession, state.legacy?.initialized == true else {
+                        continuation.resume(throwing: MCPError.invalidRequest("the legacy client session is not ready"))
+                        return
+                    }
                     state.clientRequests[number] = ClientRequest(continuation: continuation, callerSerial: caller.serial)
-                    sink.enqueue(frame)
+                    guard sink.enqueue(frame) else {
+                        state.clientRequests[number] = nil
+                        continuation.resume(throwing: MCPError.requestDeliveryFailed(method: request.method))
+                        return
+                    }
                     guard let limit else { return }
                     timeout.withLock { timer in
                         timer = Task { [self] in
@@ -1202,6 +1261,7 @@ public final class Connection: Sendable {
         id: RequestID, method: String, detail: String = "", bytes: Int, responder: Responder,
         _ work: @escaping @Sendable (_ serial: UInt64) async -> [UInt8]?
     ) {
+        configuration.beforeAdmission?(id)
         let name = detail.isEmpty ? "\(method)#\(id)" : "\(method)#\(id) \(detail)"
         var serial: UInt64 = 0
         let admission: Admission = state.withLock { state in
@@ -1215,6 +1275,7 @@ public final class Connection: Sendable {
         }
         switch admission {
         case .closing:
+            respondWithNothing(responder)
             return
         case .duplicate:
             respond(Frame.error(id: id, .invalidRequest("request id \(id) is already in use by a request in progress")), id: id, responder)
@@ -1228,17 +1289,23 @@ public final class Connection: Sendable {
             start: { [self] in start(id: id, serial: admitted, name: name, work) },
             peerIsBehind: { [sink] in sink.isOverBudget })
         switch server.acquireSlot(entry) {
-        case .started, .queued, .gone:
+        case .started, .gone:
             break
+        case .queued:
+            // Closing or cancellation may have withdrawn the request before the gate queued it.
+            if state.withLock({ $0.inflight[id]?.serial != admitted }) {
+                server.withdraw(owner: ObjectIdentifier(self), serials: [admitted])
+            }
         case .overloaded:
-            let idle = state.withLock { state in
+            let idle: [CheckedContinuation<Void, Never>]? = state.withLock { state in
                 // Only if it is still registered: a `close` that ran meanwhile has already
                 // dropped it and counted it out.
-                guard state.inflight[id]?.serial == admitted else { return [CheckedContinuation<Void, Never>]() }
+                guard state.inflight[id]?.serial == admitted else { return nil }
                 state.inflight[id] = nil
                 state.pending -= 1
                 return takeIdleWaitersLocked(&state)
             }
+            guard let idle else { return }
             for waiter in idle { waiter.resume() }
             respond(Frame.error(id: id, .overloaded("too many requests in progress; retry later")), id: id, responder)
         }
@@ -1402,14 +1469,29 @@ public final class Connection: Sendable {
         guard case .object(let filter) = params["notifications"] else {
             throw MCPError.invalidParams("notifications: missing required field")
         }
+        func flag(_ key: String) throws(MCPError) -> Bool {
+            guard let value = filter[key] else { return false }
+            guard let boolean = value.boolValue else {
+                throw MCPError.invalidParams("notifications.\(key): expected boolean")
+            }
+            return boolean
+        }
         var subscription = Subscription()
-        subscription.tools = filter["toolsListChanged"]?.boolValue ?? false
-        subscription.prompts = filter["promptsListChanged"]?.boolValue ?? false
-        subscription.resources = filter["resourcesListChanged"]?.boolValue ?? false
+        subscription.tools = try flag("toolsListChanged")
+        subscription.prompts = try flag("promptsListChanged")
+        subscription.resources = try flag("resourcesListChanged")
         var uris: [String] = []
         let budgets = configuration.budgets
-        if case .array(let list) = filter["resourceSubscriptions"] {
-            uris = list.compactMap(\.stringValue)
+        if let value = filter["resourceSubscriptions"] {
+            guard case .array(let list) = value else {
+                throw MCPError.invalidParams("notifications.resourceSubscriptions: expected array of strings")
+            }
+            for member in list {
+                guard let uri = member.stringValue else {
+                    throw MCPError.invalidParams("notifications.resourceSubscriptions: expected array of strings")
+                }
+                uris.append(uri)
+            }
             // The list is echoed in the acknowledgment, so it is bounded as given, repeats included.
             guard uris.count <= budgets.maxSubscribedResources,
                 uris.reduce(0, { $0 + $1.utf8.count }) <= budgets.maxSubscribedResourceBytes
@@ -1498,59 +1580,125 @@ public final class Connection: Sendable {
     private func dropUnwantedEventsLocked(_ state: inout State) {
         guard !state.deferredEvents.isEmpty else { return }
         let snapshot = state
-        state.deferredEvents.removeAll { !wantsLocked($0, snapshot) }
-        state.deferredKeys = Set(state.deferredEvents.map(Self.key(of:)))
+        state.deferredEvents.removeAll { pending in pending.map { !wantsLocked($0.event, snapshot) } ?? true }
+        state.deferredHead = 0
+        reindexDeferredEventsLocked(&state)
     }
 
-    /// Fans a server event out to this connection's subscribers, in the form each revision uses.
-    ///
-    /// Notifications must not pile up behind a peer that does not read. While this connection's
-    /// output is over budget, an event somebody here wants is remembered once instead of being
-    /// queued, and is delivered when there is room again: nothing is lost, and memory holds at
-    /// most one of each.
+    private func reindexDeferredEventsLocked(_ state: inout State) {
+        state.deferredIndices = Dictionary(uniqueKeysWithValues: state.deferredEvents.enumerated().compactMap { index, pending in
+            pending.map { (Self.key(of: $0.event), index) }
+        })
+    }
+
+    private struct DeferredEvent {
+        let event: ServerEvent
+        let cutoff: UInt64
+        let legacy: LegacySessionIdentity?
+    }
+
+    private enum EventRecipient {
+        case modern(RequestID, UInt64)
+        case legacy(LegacySessionIdentity)
+    }
+
+    private struct EventDelivery {
+        let event: ServerEvent
+        let recipients: [EventRecipient]
+        var next = 0
+    }
+
+    /// Delivers in order. Backpressure pauses before the next recipient, and repeated pending
+    /// events for a URI or list are coalesced. A sink that declines an event while reporting
+    /// capacity drops that recipient's event, with a diagnostic.
     func deliver(_ event: ServerEvent) {
-        let startFlush: Bool = state.withLock { state in
+        let refused: Bool = state.withLock { state in
             guard !state.closing, wantsLocked(event, state) else { return false }
-            // Behind events that are already waiting, so that their order is kept.
-            guard sink.isOverBudget || !state.deferredEvents.isEmpty else {
-                emitLocked(event, &state)
-                return false
+            let key = Self.key(of: event)
+            let pending = DeferredEvent(event: event, cutoff: state.nextSerial,
+                legacy: legacyWants(event, state) ? state.legacy?.identity : nil)
+            if let existing = state.deferredIndices[key] {
+                state.deferredEvents[existing] = pending
+            } else {
+                state.deferredIndices[key] = state.deferredEvents.count
+                state.deferredEvents.append(pending)
             }
-            if state.deferredKeys.insert(Self.key(of: event)).inserted { state.deferredEvents.append(event) }
-            guard !state.flushingDeferredEvents else { return false }
-            state.flushingDeferredEvents = true
-            return true
+            let (_, refused) = drainEventsLocked(&state)
+            if state.flushTask == nil, state.activeDelivery != nil || state.deferredHead < state.deferredEvents.count {
+                state.flushTask = Task { [self] in await flushEvents() }
+            }
+            return refused
         }
-        guard startFlush else { return }
-        Task { [self] in
-            while true {
-                await sink.waitForCapacity()
-                var delivered = 0
-                let finished: Bool = state.withLock { state in
-                    if state.closing {
-                        state.deferredEvents = []
-                        state.deferredKeys = []
-                        state.flushingDeferredEvents = false
-                        return true
-                    }
-                    // As many as there is room for, oldest first; the rest wait for the next round.
-                    while delivered < state.deferredEvents.count, !sink.isOverBudget {
-                        let event = state.deferredEvents[delivered]
-                        state.deferredKeys.remove(Self.key(of: event))
-                        if wantsLocked(event, state) { emitLocked(event, &state) }
-                        delivered += 1
-                    }
-                    state.deferredEvents.removeFirst(delivered)
-                    guard state.deferredEvents.isEmpty else { return false }
-                    state.flushingDeferredEvents = false
-                    return true
+        if refused { report(.refusedSubscriptionEvent, "the transport declined a subscription notification") }
+    }
+
+    private func flushEvents() async {
+        while !Task.isCancelled {
+            await sink.waitForCapacity()
+            let (finished, progressed, refused) = state.withLock { state in
+                guard !state.closing else { return (true, false, false) }
+                let (progressed, refused) = drainEventsLocked(&state)
+                let finished = state.activeDelivery == nil && state.deferredHead == state.deferredEvents.count
+                if finished { state.flushTask = nil }
+                return (finished, progressed, refused)
+            }
+            if refused { report(.refusedSubscriptionEvent, "the transport declined a subscription notification") }
+            if finished { return }
+            // Capacity can disappear before the next frame is offered, or a custom sink may
+            // return from its wait while still full. Back off only when this round did no work.
+            if !progressed { try? await Task.sleep(for: .milliseconds(50)) }
+        }
+    }
+
+    private func drainEventsLocked(_ state: inout State) -> (progressed: Bool, refused: Bool) {
+        var progressed = false
+        var refused = false
+        while !sink.isOverBudget {
+            if state.activeDelivery == nil {
+                guard state.deferredHead < state.deferredEvents.count,
+                    let pending = state.deferredEvents[state.deferredHead] else { break }
+                state.deferredEvents[state.deferredHead] = nil
+                state.deferredHead += 1
+                progressed = true
+                state.deferredIndices.removeValue(forKey: Self.key(of: pending.event))
+                if state.deferredHead >= 64, state.deferredHead >= state.deferredEvents.count - state.deferredHead {
+                    state.deferredEvents.removeFirst(state.deferredHead)
+                    state.deferredHead = 0
+                    reindexDeferredEventsLocked(&state)
                 }
-                if finished { return }
-                // A sink that reports room and then takes nothing must not turn this into a
-                // busy loop.
-                if delivered == 0 { try? await Task.sleep(for: .milliseconds(50)) }
+                let modern = state.subscriptions.compactMap { id, subscription -> (RequestID, UInt64)? in
+                    guard wants(subscription, pending.event), let serial = state.inflight[id]?.serial, serial < pending.cutoff else { return nil }
+                    return (id, serial)
+                }.sorted { $0.1 < $1.1 }
+                var recipients = modern.map { EventRecipient.modern($0.0, $0.1) }
+                if let legacy = pending.legacy { recipients.append(.legacy(legacy)) }
+                state.activeDelivery = EventDelivery(event: pending.event, recipients: recipients)
             }
+            guard var delivery = state.activeDelivery else { break }
+            guard delivery.next < delivery.recipients.count else {
+                state.activeDelivery = nil
+                continue
+            }
+            let recipient = delivery.recipients[delivery.next]
+            let frameKey: RequestID?
+            let stillSubscribed: Bool
+            switch recipient {
+            case .modern(let id, let serial):
+                frameKey = id
+                stillSubscribed = state.inflight[id]?.serial == serial && state.subscriptions[id] != nil
+            case .legacy(let identity):
+                frameKey = nil
+                stillSubscribed = state.legacy?.identity === identity && legacyWants(delivery.event, state)
+            }
+            if stillSubscribed, !sink.enqueue(eventFrame(delivery.event, subscriptionID: frameKey), key: frameKey) {
+                if sink.isOverBudget { break }
+                refused = true
+            }
+            delivery.next += 1
+            state.activeDelivery = delivery
+            progressed = true
         }
+        return (progressed, refused)
     }
 
     /// What makes two events the same event: the kind, and for a resource its URI, byte for byte.
@@ -1589,7 +1737,7 @@ public final class Connection: Sendable {
         legacyWants(event, state) || state.subscriptions.values.contains { wants($0, event) }
     }
 
-    private func emitLocked(_ event: ServerEvent, _ state: inout State) {
+    private func eventFrame(_ event: ServerEvent, subscriptionID: RequestID?) -> [UInt8] {
         let method: String
         var uri: String?
         switch event {
@@ -1600,30 +1748,18 @@ public final class Connection: Sendable {
             method = "notifications/resources/updated"
             uri = updated
         }
-        for (id, subscription) in state.subscriptions where wants(subscription, event) {
-            let frame = Frame.notification(method: method) { writer in
-                writer.beginObject()
+        guard subscriptionID != nil || uri != nil else { return Frame.notification(method: method) }
+        return Frame.notification(method: method) { writer in
+            writer.beginObject()
+            if let subscriptionID {
                 writer.key("_meta")
                 writer.beginObject()
-                writer.field(MetaKey.subscriptionID, id)
-                writer.endObject()
-                writer.field("uri", uri)
+                writer.field(MetaKey.subscriptionID, subscriptionID)
                 writer.endObject()
             }
-            sink.enqueue(frame, key: id)
+            writer.field("uri", uri)
+            writer.endObject()
         }
-        guard legacyWants(event, state) else { return }
-        let frame: [UInt8]
-        if let uri {
-            frame = Frame.notification(method: method) { writer in
-                writer.beginObject()
-                writer.field("uri", uri)
-                writer.endObject()
-            }
-        } else {
-            frame = Frame.notification(method: method)
-        }
-        sink.enqueue(frame)
     }
 
     // MARK: Diagnostics
@@ -1631,7 +1767,7 @@ public final class Connection: Sendable {
     /// What a diagnostic is about. A connection reports each kind at most `reportLimit` times;
     /// beyond that the reports are counted, and the count is reported when it closes.
     enum DiagnosticKind: Hashable, CustomStringConvertible {
-        case malformedNotification, malformedReply, handlerFailed, invalidResult
+        case malformedNotification, malformedReply, handlerFailed, invalidResult, refusedSubscriptionEvent
 
         var description: String {
             switch self {
@@ -1639,6 +1775,7 @@ public final class Connection: Sendable {
             case .malformedReply: "malformed replies"
             case .handlerFailed: "failed requests"
             case .invalidResult: "invalid tool results"
+            case .refusedSubscriptionEvent: "refused subscription notifications"
             }
         }
     }
@@ -1732,8 +1869,8 @@ public final class Connection: Sendable {
         switch responder {
         case .direct: sendFromReader(reply, substitute: Reply(frame: self.overloadAnswer(id: id)))
         case .batch(let collector, let slot):
-            if let members = collector.fill(slot, BatchCollector.Member(reply: reply, id: id, fromReader: true)) {
-                sendBatchFromReader(members)
+            if let batch = collector.fill(slot, BatchCollector.Member(reply: reply, id: id, fromReader: true)) {
+                sendBatchFromReader(batch)
             }
         }
     }
@@ -1743,7 +1880,9 @@ public final class Connection: Sendable {
     /// the reader built replaced by `overloadAnswer`, largest first, until it is small. Handlers' results stay: they were
     /// admitted and computed, and they are bounded by the batch size and `maxResponseBytes`;
     /// a reply that is still not small goes out as ordinary output.
-    private func sendBatchFromReader(_ members: [BatchCollector.Member]) {
+    private func sendBatchFromReader(_ batch: BatchCollector.Completed) {
+        defer { withExtendedLifetime(batch) {} }
+        let members = batch.members
         guard let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes) else { return }
         if isSmall(reply.frame) || !sink.isOverBudget {
             sendFromReader(reply, substitute: reply)
@@ -1771,8 +1910,8 @@ public final class Connection: Sendable {
     /// A batch member that gets no response settles its slot all the same, or the reply would
     /// never be complete.
     private func respondWithNothing(_ responder: Responder) {
-        if case .batch(let collector, let slot) = responder, let members = collector.fill(slot, nil) {
-            sendBatchFromReader(members)
+        if case .batch(let collector, let slot) = responder, let batch = collector.fill(slot, nil) {
+            sendBatchFromReader(batch)
         }
     }
 
@@ -1786,11 +1925,16 @@ public final class Connection: Sendable {
         switch responder {
         case .direct: sink.enqueue(frame, key: key)
         case .batch(let collector, let slot):
-            if let members = collector.fill(slot, BatchCollector.Member(reply: Reply(frame: frame), id: key, fromReader: false)),
-                let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes)
-            {
-                enqueueBatchLocked(reply, &state)
+            if let batch = collector.fill(slot, BatchCollector.Member(reply: Reply(frame: frame), id: key, fromReader: false)) {
+                deliverBatchLocked(batch, &state)
             }
+        }
+    }
+
+    private func deliverBatchLocked(_ batch: BatchCollector.Completed, _ state: inout State) {
+        defer { withExtendedLifetime(batch) {} }
+        if let reply = BatchCollector.join(batch.members, maxBytes: configuration.budgets.maxResponseBytes) {
+            enqueueBatchLocked(reply, &state)
         }
     }
 
@@ -1811,8 +1955,14 @@ public final class Connection: Sendable {
     /// wait short.
     public func close(graceSeconds: Double? = nil) async {
         let grace = graceSeconds ?? configuration.shutdownGraceSeconds
-        let abandoned: [CheckedContinuation<JSONValue, any Error>] = state.withLock { state in
+        let (abandoned, flushTask) = state.withLock { state in
             state.closing = true
+            let flushTask = state.flushTask
+            state.flushTask = nil
+            state.activeDelivery = nil
+            state.deferredEvents.removeAll()
+            state.deferredHead = 0
+            state.deferredIndices.removeAll()
             for id in state.subscriptions.keys {
                 // The server is tearing the stream down: the specification requires a cancellation
                 // notice and recommends completing the request so the client sees a graceful end.
@@ -1840,8 +1990,9 @@ public final class Connection: Sendable {
             state.subscriptions = [:]
             let abandoned = state.clientRequests.values.map(\.continuation)
             state.clientRequests = [:]
-            return abandoned
+            return (abandoned, flushTask)
         }
+        flushTask?.cancel()
         for continuation in abandoned { continuation.resume(throwing: CancellationError()) }
 
         if await !waitUntilIdle(seconds: grace, isGracePeriod: true) {
@@ -1882,10 +2033,8 @@ public final class Connection: Sendable {
     /// A batch member cut off by `close` gets no response, but the members that finished
     /// still get theirs: the slot is settled so that the reply can be complete.
     private func settleBatchSlotLocked(_ responder: Responder, _ state: inout State) {
-        if case .batch(let collector, let slot) = responder, let members = collector.fill(slot, nil),
-            let reply = BatchCollector.join(members, maxBytes: configuration.budgets.maxResponseBytes)
-        {
-            enqueueBatchLocked(reply, &state)
+        if case .batch(let collector, let slot) = responder, let batch = collector.fill(slot, nil) {
+            deliverBatchLocked(batch, &state)
         }
     }
 
@@ -1893,13 +2042,12 @@ public final class Connection: Sendable {
     /// of a `close` under way, and makes that of a later one zero. The transport calls this
     /// whenever it finds out, which may be before or after the input ended.
     package func endGracePeriod() {
-        let waiter: CheckedContinuation<Void, Never>? = state.withLock { state in
+        let waiters: [CheckedContinuation<Void, Never>] = state.withLock { state in
             state.graceEnded = true
-            guard let token = state.graceWaiter else { return nil }
-            state.graceWaiter = nil
-            return state.idleWaiters.removeValue(forKey: token)
+            defer { state.graceWaiters.removeAll() }
+            return state.graceWaiters.compactMap { state.idleWaiters.removeValue(forKey: $0) }
         }
-        waiter?.resume()
+        for waiter in waiters { waiter.resume() }
     }
 
     /// Waits until no handler is running. Returns `false` on timeout, or when the grace period
@@ -1909,7 +2057,7 @@ public final class Connection: Sendable {
         let token: Int? = state.withLock { state in
             if state.pending == 0 || limit == .zero || (isGracePeriod && state.graceEnded) { return nil }
             state.nextIdleWaiter += 1
-            if isGracePeriod { state.graceWaiter = state.nextIdleWaiter }
+            if isGracePeriod { state.graceWaiters.insert(state.nextIdleWaiter) }
             return state.nextIdleWaiter
         }
         guard let token else { return state.withLock { $0.pending == 0 } }
@@ -1938,7 +2086,7 @@ public final class Connection: Sendable {
         timeout?.cancel()
         return state.withLock { state in
             state.expiredIdleWaiters.remove(token)
-            if state.graceWaiter == token { state.graceWaiter = nil }
+            state.graceWaiters.remove(token)
             return state.pending == 0
         }
     }
@@ -1955,27 +2103,81 @@ public final class Connection: Sendable {
             let fromReader: Bool
         }
 
-        private struct Slots {
-            var members: [Member?]
-            var remaining: Int
+        /// Holds the reservation through the handoff to the sink, including size replacements.
+        final class Completed: Sendable {
+            let members: [Member]
+            private let budget: BatchReplyBudget
+            private let reservedBytes: Int
+
+            init(members: [Member], budget: BatchReplyBudget, reservedBytes: Int) {
+                self.members = members
+                self.budget = budget
+                self.reservedBytes = reservedBytes
+            }
+
+            deinit { budget.release(reservedBytes) }
         }
 
+        private enum RetainedMember {
+            case reply(Member)
+            case overloaded(RequestID?, fromReader: Bool)
+
+            var response: Member {
+                switch self {
+                case .reply(let member): member
+                case .overloaded(let id, let fromReader):
+                    Member(reply: Reply(frame: Frame.error(id: id, .overloaded("too many bytes waiting for legacy batch replies"))),
+                           id: id, fromReader: fromReader)
+                }
+            }
+        }
+
+        private struct Slots {
+            var members: [RetainedMember?]
+            var settled: [Bool]
+            var remaining: Int
+            var reservedBytes = 0
+        }
+
+        private let budget: BatchReplyBudget
         private let slots: Mutex<Slots>
 
-        init(slots count: Int) {
-            slots = Mutex(Slots(members: Array(repeating: nil, count: count), remaining: count))
+        init(slots count: Int, budget: BatchReplyBudget) {
+            self.budget = budget
+            slots = Mutex(Slots(members: Array(repeating: nil, count: count), settled: Array(repeating: false, count: count), remaining: count))
         }
 
-        /// Records one response (`nil` for one that is not sent). Returns every response once the
-        /// last slot is settled, or `nil` if there is nothing to send yet or at all.
-        func fill(_ slot: Int, _ member: Member?) -> [Member]? {
-            slots.withLock { slots in
-                slots.members[slot] = member
+        deinit { budget.release(slots.withLock { $0.reservedBytes }) }
+
+        /// Holds ordinary replies only while they wait for another slot. Once the last slot
+        /// settles, moves them and their reservation to the code sending the batch.
+        func fill(_ slot: Int, _ member: Member?) -> Completed? {
+            let completed: (members: [RetainedMember?], reservedBytes: Int)? = slots.withLock { slots in
+                guard !slots.settled[slot] else { return nil }
+                slots.settled[slot] = true
                 slots.remaining -= 1
+                if let member {
+                    let bytes = member.reply.frame.count
+                    if slots.remaining == 0 {
+                        slots.members[slot] = .reply(member)
+                    } else if budget.reserve(bytes) {
+                        slots.members[slot] = .reply(member)
+                        slots.reservedBytes += bytes
+                    } else {
+                        slots.members[slot] = .overloaded(member.id, fromReader: member.fromReader)
+                    }
+                }
                 guard slots.remaining == 0 else { return nil }
-                let present = slots.members.compactMap { $0 }
-                return present.isEmpty ? nil : present
+                defer {
+                    slots.members = []
+                    slots.reservedBytes = 0
+                }
+                return (slots.members, slots.reservedBytes)
             }
+            guard let completed else { return nil }
+            let members = completed.members.compactMap { $0?.response }
+            guard !members.isEmpty else { return nil }
+            return Completed(members: members, budget: budget, reservedBytes: completed.reservedBytes)
         }
 
         /// Replaces the largest members with size errors until the batch fits. If that fails,

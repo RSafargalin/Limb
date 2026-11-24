@@ -244,19 +244,22 @@ private let draft7 = "http://json-schema.org/draft-07/schema#"
         }
     }
 
-    @Test func idAndSchemaAreRefusedBelowTheRoot() {
-        for keyword in ["$id", "$schema"] {
-            for place: JSONValue in [
-                ["properties": ["a": [keyword: "https://json-schema.org/draft/2020-12/schema"]]],
-                ["items": [keyword: "x"]],
-                ["$defs": ["d": [keyword: "x"]], "$ref": "#/$defs/d"],
-                ["anyOf": [true, ["not": [keyword: "x"]]]],
-            ] {
-                #expect(compileError(place) != nil, "\(place)")
-            }
+    @Test func schemaDialectRequiresAResourceRoot() {
+        let dialect: JSONValue = "https://json-schema.org/draft/2020-12/schema"
+        for schema: JSONValue in [
+            ["properties": ["a": ["$schema": dialect]]],
+            ["items": ["$schema": dialect]],
+            ["$defs": ["d": ["$schema": dialect]], "$ref": "#/$defs/d"],
+            ["anyOf": [true, ["not": ["$schema": dialect]]]],
+        ] {
+            #expect(compileError(schema) != nil, "\(schema)")
         }
-        // At the root they are fine.
-        #expect(compileError(["$id": "https://example.com/s", "$schema": "https://json-schema.org/draft/2020-12/schema"]) == nil)
+        #expect(compileError(["$id": "https://example.com/s", "$schema": dialect]) == nil)
+        #expect(compileError([
+            "$id": "https://example.com/s",
+            "$defs": ["d": ["$id": "d.json", "$schema": dialect]],
+            "$ref": "d.json",
+        ]) == nil)
     }
 
     @Test func wellTypedValuesCompile() {
@@ -492,7 +495,7 @@ private let draft7 = "http://json-schema.org/draft-07/schema#"
             ["$defs": 5], ["definitions": "x"], ["$defs": ["a": 5]], ["$defs": ["a": ["type": "bogus"]]],
             ["definitions": ["a": ["pattern": "("]]], ["$defs": ["a": ["$defs": ["b": ["minLength": -1]]]]],
             ["properties": ["p": ["$defs": ["a": ["uniqueItems": 1]]]]], ["$defs": ["a": ["$ref": "#/nowhere"]]],
-            ["$defs": ["a": ["$id": "x"]]], ["then": 5], ["else": ["type": 1]], ["additionalItems": false],
+            ["$defs": ["a": ["$id": 1]]], ["then": 5], ["else": ["type": 1]], ["additionalItems": false],
             ["prefixItems": [true], "additionalItems": false],
         ] {
             #expect(compileError(schema) != nil, "\(schema)")
@@ -502,6 +505,7 @@ private let draft7 = "http://json-schema.org/draft-07/schema#"
             ["$defs": ["a": ["$ref": "#/$defs/b"], "b": ["$ref": "#/$defs/a"]]],
             ["$defs": ["a": ["$defs": ["b": ["$defs": ["c": true]]]]]],
             ["$defs": ["a": ["properties": ["x": ["$ref": "#/$defs/a"]]]]],
+            ["$id": "https://example.com/s", "$defs": ["a": ["$id": "a.json"]]],
             ["then": true, "else": false],
             ["$schema": .string(draft7), "additionalItems": false],
         ] {

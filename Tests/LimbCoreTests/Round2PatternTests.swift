@@ -1,8 +1,9 @@
 import LimbCore
 import Testing
+import Dispatch
+import Foundation
 
 #if canImport(JavaScriptCore)
-import Foundation
 import JavaScriptCore
 #endif
 
@@ -238,6 +239,11 @@ private func compileError(_ pattern: String) -> String? {
         #expect(limbMatches(#"^(?:(?<n>a)|(?<n>b))+$"#, "abba") == true)
     }
 
+    @Test func zeroRepetitionDoesNotChangeCaptureNameSyntax() {
+        #expect(compileError(#"(?<n>a)(?<n>b){0}"#) != nil)
+        #expect(limbMatches(#"^(?:(?<n>a)|(?<n>b)){0}$"#, "") == true)
+    }
+
     /// Valid ECMA 262 that Limb refuses without the doc comment of `JSONSchema` saying so
     /// (D5, a documentation defect): failing closed is safe, so this pins only the refusal.
     @Test func undocumentedRefusals() {
@@ -339,37 +345,101 @@ private func compileError(_ pattern: String) -> String? {
         }
     }
 
-    /// Random patterns over a small alphabet of constructs, against random strings.
-    /// Seeds 5 and 6 add two named groups with fixed names, so that many patterns repeat a name
-    /// — in one alternative (a syntax error) or in different ones (allowed).
-    @Test(arguments: [(UInt64(1), false), (2, false), (3, true), (4, true), (5, true), (6, true)])
+    #endif
+
+    /// Generated matches use fresh capture names. Duplicate-name syntax is checked separately
+    /// against the static semantics because engines can simplify groups under quantifiers first.
+    @Test(
+        .enabled(if: NodePatternOracle.executable != nil, "Node.js is needed for the generated comparison"),
+        arguments: [(UInt64(1), false), (2, false), (3, true), (4, true), (5, true), (6, true)]
+    )
     func generatedPatternsAgreeWithJavaScript(seed: UInt64, rich: Bool) throws {
-        let oracle = try #require(ECMAOracle())
+        let node = try #require(NodePatternOracle.executable)
         var generator = PatternGenerator(seed: seed, rich: rich)
-        var compared = 0
-        var skipped = 0
-        var unexplained: [String] = []
-        for _ in 0..<1_500 {
+        let groups = (0..<1_500).map { _ in
             let pattern = generator.pattern()
+            return [pattern] + (0..<5).map { _ in generator.string() }
+        }
+        let verdicts = try NodePatternOracle.verdicts(for: groups, executable: node)
+        try #require(verdicts.count == groups.count)
+        var unexplained: [String] = []
+        for (group, answers) in zip(groups, verdicts) {
+            let pattern = group[0]
             let compiled = try? JSONSchema(["pattern": .string(pattern)])
-            for _ in 0..<5 {
-                let string = generator.string()
-                guard let expected = oracle.verdict(pattern, string) else {
-                    skipped += 1
-                    continue
+            try #require(answers.utf8.count == group.count - 1)
+            for (string, answer) in zip(group.dropFirst(), answers.utf8) {
+                let expected: Bool?
+                switch answer {
+                case UInt8(ascii: "1"): expected = true
+                case UInt8(ascii: "0"): expected = false
+                case UInt8(ascii: "E"): expected = nil
+                default: throw NodePatternOracle.Failure.invalidResult
                 }
                 let actual: Bool? = compiled.map { $0.validate(.string(string)) == nil }
-                compared += 1
                 if expected == actual { continue }
-                if ECMAOracle.isSurrogateBoundaryDeviation(pattern, string, expected: expected, actual: actual) { continue }
                 unexplained.append("\(pattern) on \(string.debugDescription): JavaScript \(expected.map(String.init) ?? "refuses"), Limb \(actual.map(String.init) ?? "refuses")")
             }
         }
-        #expect(compared > 7_000)
-        #expect(skipped < 100)
         #expect(unexplained.isEmpty, "\(unexplained.count) disagreements, first: \(unexplained.prefix(5))")
     }
-    #endif
+}
+
+/// The generated cases use a separate runtime so a JavaScriptCore change cannot silently
+/// become an expectation for Limb's pattern implementation.
+private enum NodePatternOracle {
+    enum Failure: Error { case timedOut, processFailed(Int32), invalidResult }
+
+    static let executable: URL? = ProcessInfo.processInfo.environment["PATH"]?
+        .split(separator: ":")
+        .lazy.map { URL(fileURLWithPath: String($0)).appendingPathComponent("node") }
+        .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+
+    static func verdicts(for groups: [[String]], executable: URL) throws -> [String] {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appendingPathComponent("input.json")
+        let output = directory.appendingPathComponent("output.json")
+        try JSONEncoder().encode(groups).write(to: input)
+        try Data().write(to: output)
+
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["-e", script]
+        process.standardInput = try FileHandle(forReadingFrom: input)
+        process.standardOutput = try FileHandle(forWritingTo: output)
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        try process.run()
+        guard finished.wait(timeout: .now() + .seconds(30)) == .success else {
+            process.terminate()
+            process.waitUntilExit()
+            throw Failure.timedOut
+        }
+        guard process.terminationStatus == 0 else { throw Failure.processFailed(process.terminationStatus) }
+        return try JSONDecoder().decode([String].self, from: Data(contentsOf: output))
+    }
+
+    private static let script = """
+        const fs = require('node:fs');
+        const groups = JSON.parse(fs.readFileSync(0, 'utf8'));
+        const answers = groups.map(([pattern, ...inputs]) => {
+          let regex;
+          try { regex = new RegExp(pattern, 'uy'); } catch (error) {
+            if (error instanceof SyntaxError) return 'E'.repeat(inputs.length);
+            throw error;
+          }
+          return inputs.map(input => {
+            for (let offset = 0; offset <= input.length;) {
+              regex.lastIndex = offset;
+              if (regex.test(input)) return '1';
+              offset += input.codePointAt(offset) > 0xFFFF ? 2 : 1;
+            }
+            return '0';
+          }).join('');
+        });
+        fs.writeFileSync(1, JSON.stringify(answers));
+        """
 }
 
 #if canImport(JavaScriptCore)
@@ -426,6 +496,7 @@ private final class ECMAOracle {
         expected == true && actual == false && pattern.contains(#"\B"#) && string.unicodeScalars.contains { $0.value > 0xFFFF }
     }
 }
+#endif
 
 /// Small random patterns: atoms, groups of all kinds, alternation, every quantifier form.
 private struct PatternGenerator {
@@ -438,7 +509,7 @@ private struct PatternGenerator {
     init(seed: UInt64, rich: Bool) {
         state = seed &* 0x9E37_79B9_7F4A_7C15 | 1
         self.rich = rich
-        atoms = !rich ? Self.plainAtoms : seed >= 5 ? Self.richAtoms + ["(?<g>a)", "(?<h>b)", "(?<g>b)"] : Self.richAtoms
+        atoms = rich ? Self.richAtoms : Self.plainAtoms
     }
 
     mutating func next() -> UInt64 {
@@ -496,4 +567,3 @@ private struct PatternGenerator {
         return result
     }
 }
-#endif

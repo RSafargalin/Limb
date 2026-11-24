@@ -25,6 +25,7 @@ public import LimbCore
 /// Parameters need types that conform to `SchemaRepresentable` (scalars, arrays, optionals,
 /// string-keyed dictionaries and `@Schema` types); anything else is a compile-time error.
 /// A parameter of type `ToolContext` receives the request context and is not an argument.
+/// Use `contextParameter` with the parameter's name when its type is an alias for the context.
 ///
 /// A tool type isolated to a global actor works when the attribute is written on the type
 /// (`@MainActor @Tool struct …`): the macro then makes `definition` nonisolated. Isolation the
@@ -32,11 +33,11 @@ public import LimbCore
 /// conforms to, or a global actor spelled through a lowercase typealias — still fails to
 /// compile with "conformance … crosses into main actor-isolated code"; write the attribute on
 /// the tool type itself.
-@attached(member, names: named(definition), named(call(arguments:context:)), named(__limbDefault(__limbArgument:)))
+@attached(member, names: named(definition), named(call(arguments:context:)), arbitrary)
 @attached(extension, conformances: MCPTool)
 public macro Tool(
     _ name: String? = nil, title: String? = nil, readOnly: Bool? = nil, destructive: Bool? = nil,
-    idempotent: Bool? = nil, openWorld: Bool? = nil
+    idempotent: Bool? = nil, openWorld: Bool? = nil, contextParameter: String? = nil
 ) = #externalMacro(module: "LimbMacros", type: "ToolMacro")
 
 /// Derives a JSON Schema and JSON conversion for a struct or a string-backed enum.
@@ -45,7 +46,7 @@ public macro Tool(
 /// with default values are not required.
 @attached(
     extension, conformances: SchemaRepresentable,
-    names: named(jsonSchema(in:)), named(init(json:)), named(jsonValue))
+    names: named(jsonSchema(in:)), named(init(json:)), named(jsonValue), named(jsonValue(maxDepth:)))
 public macro Schema() = #externalMacro(module: "LimbMacros", type: "SchemaMacro")
 
 /// Helpers the `@Tool` macro expands to. Not meant to be called by hand.
@@ -55,6 +56,19 @@ public enum ToolSupport {
     public static func result(_ value: [ContentBlock]) -> ToolResult { ToolResult(content: value) }
     public static func result(_ value: ContentBlock) -> ToolResult { ToolResult(content: [value]) }
     public static func result<T: SchemaRepresentable>(_ value: T) -> ToolResult { .structured(value.jsonValue) }
+
+    public static func result(_ value: ToolResult, context: RequestContext) throws -> ToolResult { result(value) }
+    public static func result(_ value: String, context: RequestContext) throws -> ToolResult { result(value) }
+    public static func result(_ value: [ContentBlock], context: RequestContext) throws -> ToolResult { result(value) }
+    public static func result(_ value: ContentBlock, context: RequestContext) throws -> ToolResult { result(value) }
+    public static func result<T: SchemaRepresentable>(_ value: T, context: RequestContext) throws -> ToolResult {
+        let limit = context.connection.server.configuration.maxToolOutputDepth
+        do {
+            return .structured(try value.jsonValue(maxDepth: limit))
+        } catch {
+            throw ToolError("Typed tool output exceeds the JSON nesting depth limit (\(limit))")
+        }
+    }
 
     public static func outputSchema(_ type: ToolResult.Type) -> JSONObject? { nil }
     public static func outputSchema(_ type: String.Type) -> JSONObject? { nil }
@@ -74,6 +88,10 @@ public enum ToolSupport {
     )
     @_disfavoredOverload
     public static func result<T>(_ value: T) -> ToolResult { ToolResult() }
+
+    @available(*, unavailable, message: "a tool cannot return this type: return String, ToolResult, content blocks, or a type with a JSON Schema")
+    @_disfavoredOverload
+    public static func result<T>(_ value: T, context: RequestContext) throws -> ToolResult { ToolResult() }
 
     @available(*, unavailable, message: "this result type has no JSON Schema; see the error on the tool's 'call' method")
     @_disfavoredOverload

@@ -21,8 +21,8 @@ public struct LineFramer: Sendable {
     private var discarding = false
 
     public init(maxFrameBytes: Int, initialCapacity: Int = 64 * 1024) {
-        self.maxFrameBytes = maxFrameBytes
-        buffer = [UInt8](repeating: 0, count: Swift.max(4096, Swift.min(initialCapacity, LineFramer.sum(maxFrameBytes, 1))))
+        self.maxFrameBytes = max(0, maxFrameBytes)
+        buffer = [UInt8](repeating: 0, count: max(4096, min(initialCapacity, LineFramer.sum(self.maxFrameBytes, 1))))
     }
 
     /// Addition that stops at `Int.max`: a limit of `Int.max` means "no limit", not a trap.

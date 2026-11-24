@@ -119,6 +119,24 @@ public struct JSONNumber: Sendable, CustomStringConvertible {
         }
     }
 
+    package var isWithinExactDecimalRange: Bool {
+        switch storage {
+        case .int, .double: return true
+        case .lexeme: return decimal.isWithinExactRange
+        }
+    }
+
+    /// A stable spelling for equivalent numbers in the exact decimal range.
+    package var canonicalDecimal: JSONNumber {
+        if case .int = storage { return self }
+        let value = decimal
+        guard value.isWithinExactRange else { return self }
+        if let integer = value.int64Value { return JSONNumber(integer) }
+        let digits = String(decoding: value.digits.map { 0x30 + $0 }, as: UTF8.self)
+        let sign = value.negative ? "-" : ""
+        return JSONNumber(validatedLexeme: "\(sign)0.\(digits)e\(value.exponent)")
+    }
+
     static func format(_ value: Double) -> String {
         // Swift prints the shortest text that round-trips; "5.0" and "1e+100" are both valid JSON.
         value.description
@@ -274,6 +292,8 @@ struct ExactDecimal: Hashable {
 
     /// Zero has no digits and exponent 0, so it is an integer too.
     var isInteger: Bool { Int64(digits.count) <= exponent }
+
+    var isWithinExactRange: Bool { (-Self.exponentBound...Self.exponentBound).contains(exponent) }
 
     var int64Value: Int64? {
         guard !digits.isEmpty else { return 0 }

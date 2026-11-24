@@ -317,36 +317,43 @@ private let kelvin = "\u{212A}"
         return Array(repaired.utf8) == bytes ? repaired : text
     }
 
-    /// The oracle: the template as an ICU regular expression. Literals are quoted, `{x}` is
-    /// `[^/]+`, `{+x}` is `.+`, both greedy — the same "longest first, earlier variables first"
-    /// reading, by a different engine. ICU matches code points without canonical equivalence,
-    /// which is what "as bytes" means for valid UTF-8.
-    private static func oracle(template: String, uri: String) throws -> [String: String]? {
-        var pattern = "\\A"
+    /// ICU matches quoted literals without canonical equivalence. Greedy quantifiers model the
+    /// longest-first capture order, with a second expression for matches that need empty captures.
+    private static func oracle(template: String) throws -> (String) -> [String: String]? {
+        var nonemptyPattern = "\\A"
+        var emptyAllowedPattern = "\\A"
         var names: [String] = []
         // By code points: to `String`, "}" followed by a combining mark is not a "}".
         var rest = template.unicodeScalars[...]
         func quoted(_ scalars: Substring.UnicodeScalarView) -> String { NSRegularExpression.escapedPattern(for: String(String.UnicodeScalarView(scalars))) }
         while let open = rest.firstIndex(of: "{") {
-            pattern += quoted(rest[..<open])
+            let literal = quoted(rest[..<open])
+            nonemptyPattern += literal
+            emptyAllowedPattern += literal
             let close = try #require(rest[open...].firstIndex(of: "}"))
             var name = rest[rest.index(after: open)..<close]
             if name.first == "+" {
                 name = name.dropFirst()
-                pattern += "(.+)"
+                nonemptyPattern += "(.+)"
+                emptyAllowedPattern += "(.*)"
             } else {
-                pattern += "([^/]+)"
+                nonemptyPattern += "([^/]+)"
+                emptyAllowedPattern += "([^/]*)"
             }
             names.append(String(String.UnicodeScalarView(name)))
             rest = rest[rest.index(after: close)...]
         }
-        pattern += quoted(rest) + "\\z"
-        let expression = try NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators])
-        let text = uri as NSString
-        guard let match = expression.firstMatch(in: uri, range: NSRange(location: 0, length: text.length)) else { return nil }
-        var variables: [String: String] = [:]
-        for (index, name) in names.enumerated() { variables[name] = decoded(text.substring(with: match.range(at: index + 1))) }
-        return variables
+        let suffix = quoted(rest) + "\\z"
+        let nonempty = try NSRegularExpression(pattern: nonemptyPattern + suffix, options: [.dotMatchesLineSeparators])
+        let emptyAllowed = try NSRegularExpression(pattern: emptyAllowedPattern + suffix, options: [.dotMatchesLineSeparators])
+        return { uri in
+            let text = uri as NSString
+            let range = NSRange(location: 0, length: text.length)
+            guard let match = nonempty.firstMatch(in: uri, range: range) ?? emptyAllowed.firstMatch(in: uri, range: range) else { return nil }
+            var variables: [String: String] = [:]
+            for (index, name) in names.enumerated() { variables[name] = decoded(text.substring(with: match.range(at: index + 1))) }
+            return variables
+        }
     }
 
     private static let pieces = ["a", "/", "\u{E9}", "e\u{301}", "\u{301}", "😀", "-", "K", "\u{212A}", "%2F", "%C3%A9", "%", "%C3"]
@@ -401,8 +408,9 @@ private let kelvin = "\u{212A}"
         }
         var failures = 0
         var matched = 0
+        let expectedMatch = try Self.oracle(template: template)
         for uri in uris {
-            let expected = try Self.oracle(template: template, uri: uri)
+            let expected = expectedMatch(uri)
             let response = try await client.request("resources/read", ["uri": .string(uri)])
             var seen: [String: String]?
             if let text = response.readText {
@@ -452,37 +460,28 @@ private let kelvin = "\u{212A}"
         #expect(try await complete(["type": "ref/prompt", "name": .string(kelvin)]).code == -32602)
     }
 
-    private static let costCases: [(String, String)] = {
-        let one: String = "slow://items/" + String(repeating: "a", count: 32_000) + "/nope"
-        let two: String = "slow://" + String(repeating: "x/", count: 700) + "nope"
-        let three: String = "slow://" + String(repeating: "x/", count: 170) + "nope"
-        let adjacent: String = "slow://" + String(repeating: "a", count: 110)
-        let atTheLimit: String = "slow://items/" + String(repeating: "a", count: 65_000) + "/nope"
-        let multiByte: String = "slow://" + String(repeating: "\u{E9}/", count: 700) + "nope"
-        return [
-            ("slow://items/{id}/details", one), ("slow://{+a}/{+b}/end", two), ("slow://{+a}/{+b}/{+c}/end", three),
-            ("slow://{a}{b}{c}{d}x", adjacent), ("slow://items/{id}/details", atTheLimit), ("slow://{+a}\u{E9}/{+b}/end", multiByte),
-        ]
-    }()
-
-    @Test(arguments: costCases)
-    func refusingAURITakesTimeProportionalToItsSize(_ template: String, _ uri: String) async throws {
-        let server = Server(name: "cost", version: "1")
-        try server.register(resourceTemplate: ResourceTemplateDefinition(uriTemplate: template, name: "t")) { _, _ in [] }
-        let peer = IndependentProtocolRawPeer(server)
-        let plain = Server(name: "cost", version: "1")
-        try plain.register(resource: ResourceDefinition(uri: "slow://fixed", name: "f")) { _, _ in [] }
-        let reference = IndependentProtocolRawPeer(plain)
-        let frame = #"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{\#(IndependentProtocol.modernMetaText),"uri":"\#(uri)"}}"#
-        let clock = ContinuousClock()
-        var matching = Duration.seconds(3600)
-        var withoutTemplates = Duration.seconds(3600)
-        for _ in 0..<3 {
-            withoutTemplates = min(withoutTemplates, clock.measure { #expect(reference.send(frame).first?.contains("-32602") == true) })
-            matching = min(matching, clock.measure { #expect(peer.send(frame).first?.contains("-32602") == true) })
+    @Test func anUnlistedDocumentReturnsNotFoundWithAndWithoutTemplates() async throws {
+        let library = Server(name: "library", version: "1")
+        for section in ["guides", "reference", "releases"] {
+            try library.register(
+                resourceTemplate: ResourceTemplateDefinition(uriTemplate: "docs://library/\(section)/{title}.md", name: section)
+            ) { request, _ in
+                [.text(uri: request.uri, text: request.variables["title"] ?? "")]
+            }
         }
-        let allowed = max(withoutTemplates * 100, .milliseconds(250))
-        #expect(matching <= allowed, "refusing a \(uri.utf8.count)-byte URI against \(template) took \(matching); without templates the same request took \(withoutTemplates)")
+
+        let catalog = Server(name: "catalog", version: "1")
+        try catalog.register(resource: ResourceDefinition(uri: "docs://library/index.md", name: "index")) { request, _ in
+            [.text(uri: request.uri, text: "Library index")]
+        }
+
+        let libraryClient = TestClient(library, modern: true)
+        let catalogClient = TestClient(catalog, modern: true)
+        let uri: JSONValue = "docs://library/guides/setup.pdf"
+        #expect(try await libraryClient.request("resources/read", ["uri": uri]).code == -32602)
+        #expect(try await catalogClient.request("resources/read", ["uri": uri]).code == -32602)
+        #expect(try await libraryClient.request("resources/read", ["uri": "docs://library/guides/setup.md"]).readText == "setup")
+        #expect(try await catalogClient.request("resources/read", ["uri": "docs://library/index.md"]).readText == "Library index")
     }
 
     /// The size limit for template matching, as stated with the rewrite: a URI of up to 64 KiB

@@ -70,19 +70,18 @@ extension IncomingMessage {
             throw invalid(.invalidRequest("message has neither \"method\" nor \"id\""), id: nil)
         }
         if let result = object["result"] {
+            guard object["error"] == nil else {
+                throw invalid(.invalidRequest("a response must have exactly one of \"result\" and \"error\""), id: id)
+            }
             return .response(id: id, outcome: .success(result))
         }
-        if case .object(let errorObject) = object["error"],
-            let code = errorObject["code"]?.intValue
-        {
-            let message = errorObject["message"]?.stringValue ?? ""
+        if let error = object["error"] {
+            guard case .object(let errorObject) = error, let code = errorObject["code"]?.intValue,
+                let message = errorObject["message"]?.stringValue
+            else {
+                throw invalid(.invalidRequest("an error response requires an integer code and a string message"), id: id)
+            }
             return .response(id: id, outcome: .failure(MCPError(code: code, message: message, data: errorObject["data"])))
-        }
-        if object["error"] != nil {
-            // A reply whose error is malformed is still a reply. Answering it would put a
-            // second response under an id that may also name one of the peer's own requests;
-            // it ends the request it answers, as a failure.
-            return .response(id: id, outcome: .failure(.internalError("the peer sent a malformed error response")))
         }
         throw invalid(.invalidRequest("message has no \"method\", \"result\" or \"error\""), id: id)
     }

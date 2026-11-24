@@ -313,8 +313,9 @@ private func onRoomyThread<Value: Sendable>(_ body: @escaping @Sendable () -> Va
             if case .failure = Parse(text, JSONParseOptions(maxNodes: nodes)) { Issue.record("\(text) refused with maxNodes \(nodes)") }
             if case .failure = Parse(text, JSONParseOptions(maxNodes: nodes + 1)) { Issue.record("\(text) refused with maxNodes \(nodes + 1)") }
             for limit in [nodes - 1, 0, -1] {
-                guard case .failure(.nodeLimitExceeded(limit), _) = Parse(text, JSONParseOptions(maxNodes: limit)) else {
-                    Issue.record("\(text) with maxNodes \(limit): \(Parse(text, JSONParseOptions(maxNodes: limit)))")
+                let parsed = Parse(text, JSONParseOptions(maxNodes: limit))
+                guard case .failure(.nodeLimitExceeded(let effectiveLimit), _) = parsed, effectiveLimit == max(0, limit) else {
+                    Issue.record("\(text) with maxNodes \(limit): \(parsed)")
                     continue
                 }
             }

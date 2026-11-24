@@ -21,14 +21,17 @@ import Synchronization
 public final class Server: Sendable {
     public let configuration: ServerConfiguration
     let sealer: any RequestStateSealer
+    let batchReplyBudget: BatchReplyBudget
     private let registry: Mutex<RegistrySnapshot>
     private let connections = Mutex(ConnectionTable())
     /// `{"io.modelcontextprotocol/serverInfo":{…}}` members, ready to splice into a result's `_meta`.
     let serverInfoMember: [UInt8]
 
     public init(configuration: ServerConfiguration) {
+        let configuration = configuration.normalized()
         self.configuration = configuration
         sealer = configuration.requestStateSealer ?? AEADRequestStateSealer.ephemeral()
+        batchReplyBudget = BatchReplyBudget(limit: configuration.budgets.maxOutboundBytes)
         registry = Mutex(RegistrySnapshot())
         var writer = JSONWriter()
         writer.field(MetaKey.serverInfo, configuration.info, .r2026_07_28)
@@ -91,8 +94,10 @@ public final class Server: Sendable {
         let input: JSONSchema
         var output: JSONSchema?
         do {
-            input = try JSONSchema(.object(definition.inputSchema))
-            if let outputSchema = definition.outputSchema { output = try JSONSchema(.object(outputSchema)) }
+            input = try JSONSchema(.object(definition.inputSchema), registeredSchemas: configuration.schemaResources)
+            if let outputSchema = definition.outputSchema {
+                output = try JSONSchema(.object(outputSchema), registeredSchemas: configuration.schemaResources)
+            }
         } catch {
             throw RegistrationError(reason: "tool \"\(definition.name)\": \(error)")
         }
@@ -161,9 +166,12 @@ public final class Server: Sendable {
 
     /// Registers a family of resources addressed by a URI template such as `file:///{path}`.
     ///
-    /// Limb takes the subset of RFC 6570 resource templates use: `{name}` and `{+name}`, with
-    /// dotted names (`{user.id}`). A template that names the same variable twice is refused,
-    /// although RFC 6570 allows it: a match would have two values for one name.
+    /// Limb supports `{name}` and `{+name}`, with dotted names (`{user.id}`). Repeated variables
+    /// and templates over 4 KiB are refused. Reverse matching prefers the longest nonempty
+    /// captures and falls back to empty captures when necessary. A simple variable cannot
+    /// consume a raw slash. Both operators decode percent-encoded values. Matching URIs up to
+    /// 64 KiB uses a shared budget of four million byte comparisons and matching-table steps
+    /// for all candidates in a single request.
     public func register(
         resourceTemplate definition: ResourceTemplateDefinition, cache: CachePolicy? = nil,
         complete: CompletionHandler? = nil, read: @escaping ResourceReader
@@ -199,6 +207,9 @@ public final class Server: Sendable {
     public func register(
         prompt definition: PromptDefinition, complete: CompletionHandler? = nil, handler: @escaping PromptHandler
     ) throws(RegistrationError) {
+        guard Set(definition.arguments.map(\.name)).count == definition.arguments.count else {
+            throw RegistrationError(reason: "prompt \"\(definition.name)\" declares duplicate or canonically equivalent argument names")
+        }
         let entry = PromptEntry(definition: definition, complete: complete, handler: handler)
         try mutate(.prompts) { contents throws(RegistrationError) in
             guard contents.promptIndex[ExactString(definition.name)] == nil else {
@@ -242,7 +253,14 @@ public final class Server: Sendable {
     /// Creates the protocol engine for one connection. Transports call this; `sink` receives
     /// every outgoing frame.
     public func connect(to sink: any FrameSink) -> Connection {
-        let connection = Connection(server: self, sink: sink)
+        connect(to: sink, authenticatedPrincipal: nil)
+    }
+
+    /// Connects a transport that has already authenticated a principal. The transport supplies
+    /// its stable principal identifier for the lifetime of the connection. Multi-round request
+    /// state is then bound to that principal across reconnections and workers using the same key.
+    public func connect(to sink: any FrameSink, authenticatedPrincipal: String?) -> Connection {
+        let connection = Connection(server: self, sink: sink, authenticatedPrincipal: authenticatedPrincipal)
         connections.withLock { $0.insert(connection) }
         return connection
     }
@@ -419,11 +437,13 @@ public final class Server: Sendable {
             } else {
                 // The owner's own queue counts by the answer just given, not by a second one.
                 for (other, queue) in gate.queues where other == owner || !queue.peerIsBehind() {
+                    guard queue.count <= budgets.maxQueuedRequests - count,
+                        queue.bytes <= budgets.maxQueuedBytes - bytes else { return .overloaded }
                     count += queue.count
                     bytes += queue.bytes
                 }
             }
-            guard count < budgets.maxQueuedRequests, bytes + entry.bytes <= budgets.maxQueuedBytes else {
+            guard count < budgets.maxQueuedRequests, entry.bytes <= budgets.maxQueuedBytes - bytes else {
                 return .overloaded
             }
             gate.queues[owner, default: OwnerQueue(peerIsBehind: entry.peerIsBehind)].append(entry, sequence: gate.nextSequence)
