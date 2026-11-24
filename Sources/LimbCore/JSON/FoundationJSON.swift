@@ -175,7 +175,7 @@ enum FoundationJSON {
             /// Index of the next child to convert.
             var next = 0
             var items: [JSONValue] = []
-            var object = JSONObject()
+            var objectKeys: [String] = []
             /// The name the child being converted will be stored under.
             var key = ""
         }
@@ -226,7 +226,8 @@ enum FoundationJSON {
                     if dictionary.count > 0 {
                         try descend(frames.count)
                         var frame = Frame(dictionary: dictionary, keys: dictionary.allKeys, next: 1)
-                        frame.object = JSONObject(minimumCapacity: dictionary.count)
+                        frame.objectKeys.reserveCapacity(dictionary.count)
+                        frame.items.reserveCapacity(dictionary.count)
                         (frame.key, pending) = try member(of: dictionary, named: frame.keys[0])
                         frames.append(frame)
                         continue
@@ -251,13 +252,19 @@ enum FoundationJSON {
                         }
                         value = .array(frames.removeLast().items)
                     } else if let dictionary = frames[top].dictionary {
-                        frames[top].object.appendUnchecked(frames[top].key, value)
+                        // Collect unique decoded keys and build the lookup index once. Updating
+                        // an indexed object inside the conversion stack can copy its dictionary
+                        // on every insertion on Swift 6.2.
+                        let key = frames[top].key
+                        frames[top].objectKeys.append(key)
+                        frames[top].items.append(value)
                         if next < frames[top].keys.count {
                             frames[top].next = next + 1
                             (frames[top].key, pending) = try member(of: dictionary, named: frames[top].keys[next])
                             break
                         }
-                        value = .object(frames.removeLast().object)
+                        let finished = frames.removeLast()
+                        value = .object(JSONObject(uniqueKeys: finished.objectKeys, values: finished.items, positions: nil))
                     } else {
                         throw JSONParseError(kind: .malformed, offset: 0)
                     }
