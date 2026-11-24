@@ -89,7 +89,9 @@ struct IndependentClientRequestDeliveryTests {
         try #require(await independentConcurrencyEventually { rootsTask.isCancelled })
 
         race.releaseSink.signal()
-        try #require(await independentConcurrencyEventually { race.cancelReturned.value && race.releaseHandler.waiting == 1 })
+        try #require(await independentConcurrencyEventually { race.cancelReturned.value })
+        try #require(fixture.sink.cancellations(for: refusedID).isEmpty)
+        try #require(await independentConcurrencyEventually { race.releaseHandler.waiting == 1 })
         #expect(!race.sinkTimedOut.value)
         #expect(race.errors.value == [MCPError.Code.requestDeliveryFailed])
         fixture.send([

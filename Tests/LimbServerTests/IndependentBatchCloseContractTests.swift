@@ -341,9 +341,10 @@ struct IndependentBatchCloseContractTests {
         #expect(!firstSink.timedOut.value)
         let delivered = try #require(await firstSink.recording.next(timeout: .seconds(2)))
         let accepted = try #require(delivered.json?.arrayValue?.first { $0["id"] == "list" }?["result"])
-        second.send(request)
+        second.send(#"[{"jsonrpc":"2.0","id":"next","method":"tools/list"},{"jsonrpc":"2.0","id":"pong","method":"ping"}]"#)
         let recovered = try #require(await second.sink.next(timeout: .seconds(2)))
-        #expect(recovered.json?.arrayValue?.first { $0["id"] == "list" }?["result"] == accepted)
+        #expect(recovered.json?.arrayValue?.first { $0["id"] == "next" }?["result"] == accepted)
+        #expect(recovered.json?.arrayValue?.first { $0["id"] == "pong" }?["result"] == [:])
         await first.close(graceSeconds: 0)
         await second.connection.close(graceSeconds: 0)
     }
