@@ -387,6 +387,52 @@ extension IndependentStdioTransportTests {
             #expect(fixture.log.all.isEmpty, "\(fixture.log.all)")
         }
 
+        #if canImport(Glibc)
+        @Test func aWrittenFrameDoesNotLookStalledWhenItFillsTheLastPipeBuffer() throws {
+            let fixture = try independentStdioFixture { $0.outputDrainSeconds = 0 }
+            let frameWritten = DispatchSemaphore(value: 0)
+            let finishAccounting = DispatchSemaphore(value: 0)
+            let client = Client(fixture.server)
+            defer {
+                finishAccounting.signal()
+                client.tearDown()
+            }
+            independentStdioSetNonBlocking(client.serverOutput)
+            let pageSize = Int(getpagesize())
+            let padding = [UInt8](repeating: 0, count: pageSize)
+            var filled = 0
+            while filled < 1 << 20 {
+                let count = padding.withUnsafeBytes { write(client.serverOutput, $0.baseAddress, $0.count) }
+                if count < 0 {
+                    try #require(errno == EAGAIN)
+                    break
+                }
+                try #require(count == pageSize)
+                filled += count
+            }
+            try #require(filled < 1 << 20, "The test pipe should reach its normal kernel capacity")
+            var drained = [UInt8](repeating: 0, count: pageSize)
+            try #require(drained.withUnsafeMutableBytes { read(client.readEnd, $0.baseAddress, $0.count) } == pageSize)
+
+            client.start { transport in
+                transport.beforeWriteAccounting = {
+                    frameWritten.signal()
+                    if finishAccounting.wait(timeout: .now() + .seconds(15)) == .timedOut {
+                        Issue.record("The test did not release the writer")
+                    }
+                }
+            }
+            try #require(client.send(#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"# + "\n", absorb: false))
+            try #require(frameWritten.wait(timeout: .now() + .seconds(5)) == .success)
+            var descriptor = pollfd(fd: client.serverOutput, events: Int16(POLLOUT), revents: 0)
+            try #require(poll(&descriptor, 1, 0) == 0, "The written frame occupied the last pipe buffer")
+
+            client.closeInput()
+            try #require(client.stopped(within: 5))
+            #expect(fixture.log.all.isEmpty, "\(fixture.log.all)")
+        }
+        #endif
+
         @Test func aZeroDeadlineDoesNotLoseAnswersOfAReadingClient() throws {
             let fixture = try independentStdioFixture { $0.outputDrainSeconds = 0 }
             var incomplete = 0

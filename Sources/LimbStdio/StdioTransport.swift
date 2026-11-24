@@ -317,6 +317,8 @@ final class StdioSession: Sendable {
         var writerDone = false
         /// The writer is about to close its descriptor. The watchdog can no longer poll it.
         var writerFinishing = false
+        /// The writer settled its frame but has yet to remove its charge from the queue.
+        var frameFinished = false
         /// The session stopped waiting for the writer; set before any waiter could be missed.
         var writerAbandoned = false
         var backpressuredAtDeadline = false
@@ -477,11 +479,10 @@ final class StdioSession: Sendable {
                             return nil
                         }
                         state.writerAbandoned = true
-                        // The queue still charges a frame after the kernel has accepted it and
-                        // even after the peer has read it. At a short drain limit that is enough
-                        // to stop waiting, but only a non-writable output signals backpressure.
-                        // The writer takes this same lock before closing its duplicate.
-                        if output >= 0 {
+                        // A settled frame still counted by the queue can itself have filled
+                        // the last buffer. Only probe if there is more work to write. The
+                        // writer takes this same lock before closing its duplicate.
+                        if output >= 0, !state.frameFinished || queue.usage.queuedFrames > 0 {
                             var descriptor = pollfd(fd: output, events: Int16(POLLOUT), revents: 0)
                             state.backpressuredAtDeadline = poll(&descriptor, 1, 0) == 0
                         }
@@ -638,8 +639,10 @@ final class StdioSession: Sendable {
                     connection.endGracePeriod()
                 }
             }
+            completion.withLock { $0.frameFinished = true }
             beforeWriteAccounting?()
             queue.didWrite()
+            completion.withLock { $0.frameFinished = false }
         }
         completion.withLock { $0.writerFinishing = true }
         closeWriterOutput(writerOutput)
