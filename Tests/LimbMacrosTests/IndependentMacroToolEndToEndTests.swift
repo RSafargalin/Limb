@@ -445,7 +445,7 @@ private func expectToolError(
         expectToolError(try await client.independentMacroCall("im_run_optionals", ["point": ["x": 1]]), mentioning: ["point", "y"])
     }
 
-    @Test func explicitNullForAnOptionalArgumentMeansAbsent() async throws {
+    @Test func explicitNullForAnOptionalArgumentDecodesAsNil() async throws {
         let client = TestClient(try makeServer())
         let listed = try #require(try await client.independentMacroListed("im_run_optionals"))
         #expect(listed["inputSchema"]?["properties"]?["count"] == ["anyOf": [["type": "integer"], ["type": "null"]]])
@@ -455,11 +455,11 @@ private func expectToolError(
         #expect(nulls["result"]?["isError"] == false, "\(nulls)")
         #expect(nulls["result"]?["structuredContent"] == ["text": nil, "count": nil, "point": nil, "list": nil])
 
-        // With a default, `null` yields the default, whatever the default is.
+        // Swift optional arguments decode null as nil even when a default is declared.
         let defaults = try await client.independentMacroCall("im_run_defaults", ["required": "r", "maybe": nil, "maybeSeven": nil])
         #expect(defaults["result"]?["isError"] == false, "\(defaults)")
         #expect(defaults["result"]?["structuredContent"]?["maybe"] == .null)
-        #expect(defaults["result"]?["structuredContent"]?["maybeSeven"] == 7)
+        #expect(defaults["result"]?["structuredContent"]?["maybeSeven"] == .null)
 
         // `null` is still not a value of the wrapped type: inside an optional object, a
         // required member cannot be null, and a wrong type is still wrong.
@@ -468,9 +468,7 @@ private func expectToolError(
         expectToolError(try await client.independentMacroCall("im_run_optionals", ["count": false]), mentioning: ["count"])
     }
 
-    // observed: an argument that has a default but is not optional keeps the plain schema of
-    // its type, so `null` for it is a validation error — although the generated decoder would
-    // read `null` as "use the default". The schema decides, because it runs first.
+    // The declared default permits omission. Explicit null still fails schema validation.
     @Test func explicitNullForANonOptionalArgumentWithADefaultIsRejected() async throws {
         let client = TestClient(try makeServer())
         expectToolError(try await client.independentMacroCall("im_run_defaults", ["required": "r", "count": nil]), mentioning: ["count"])
@@ -670,7 +668,13 @@ private func expectToolError(
     @Test func aReadyToolResultPassesThrough() async throws {
         let client = TestClient(try makeServer())
         let ready = try await client.independentMacroCall("im_run_ready", ["fail": false])
-        #expect(ready["result"]?["content"] == [["type": "text", "text": "one"], ["type": "text", "text": "two"]])
+        let content = try #require(ready["result"]?["content"]?.arrayValue)
+        try #require(content.count == 3)
+        #expect(content[0] == ["type": "text", "text": "one"])
+        #expect(content[1] == ["type": "text", "text": "two"])
+        #expect(content[2]["type"] == "text")
+        let payload = try #require(content[2]["text"]?.stringValue)
+        #expect(try JSON.parse(Array(payload.utf8)) == ["k": 1])
         #expect(ready["result"]?["structuredContent"] == ["k": 1])
         #expect(ready["result"]?["isError"] == false)
         let failed = try await client.independentMacroCall("im_run_ready", ["fail": true])

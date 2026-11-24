@@ -650,15 +650,12 @@ private struct QueueModel {
         #expect(
             Self.classify(#"{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"no such method","data":{"m":"x"}}}"#)
                 == .failure(7, MCPError(code: -32601, message: "no such method", data: ["m": "x"])))
-        #expect(Self.classify(#"{"jsonrpc":"2.0","id":7,"error":{"code":5}}"#) == .failure(7, MCPError(code: 5, message: "")))
+        #expect(Self.classify(#"{"jsonrpc":"2.0","id":7,"error":{"code":5,"message":""}}"#) == .failure(7, MCPError(code: 5, message: "")))
         // A method wins over a result: it is a request.
         #expect(Self.classify(#"{"jsonrpc":"2.0","id":7,"method":"m","result":1}"#) == .request(7, "m", [:]))
-        // A result wins over an error.
-        #expect(Self.classify(#"{"jsonrpc":"2.0","id":7,"result":1,"error":{"code":1,"message":"x"}}"#) == .result(7, 1))
     }
 
-    /// A reply whose `error` member is not a proper error object is still a reply: it ends the
-    /// request it answers, as a failure, and is never answered itself.
+    /// Invalid error envelopes retain their reply attribution and correlated ID.
     @Test(arguments: [
         #""boom""#, "null", "5", "[]", "{}", #"{"message":"no code"}"#, #"{"code":"-1","message":"a string for a code"}"#,
         #"{"code":1.5,"message":"a fraction for a code"}"#, #"{"code":null}"#, #"{"code":[1]}"#, "true",
@@ -666,12 +663,12 @@ private struct QueueModel {
     func aMalformedErrorIsStillAReply(_ error: String) {
         for id in ["7", "\"r\""] {
             let shape = Self.classify(#"{"jsonrpc":"2.0","id":\#(id),"error":\#(error)}"#)
-            guard case .failure(let found, let failure) = shape else {
+            guard case .invalid(let found, _, let flags) = shape else {
                 Issue.record("error \(error) under id \(id) classified as \(shape)")
                 continue
             }
             #expect(found == RequestID(json: try! JSON.parse(id)))
-            #expect(failure.code == MCPError.Code.internalError)
+            #expect(flags == .reply)
         }
     }
 
@@ -714,14 +711,7 @@ private struct QueueModel {
         #expect(Self.classify(#"{"jsonrpc":"2.0","id":4,"method":5}"#) == .invalid(4, invalidRequest, .none))
     }
 
-    /// SUSPECTED DEFECT (reported, left failing on purpose). The flags are meant to say what a
-    /// message was meant to be before anything about it is checked, and that is how they are
-    /// set when `"jsonrpc"` is wrong. The checks that come after it do not all pass them on:
-    /// a reply without an id (`{"jsonrpc":"2.0","result":1}`) is not flagged as a reply, and a
-    /// message with nothing in it but a valid version (`{"jsonrpc":"2.0"}`), or with an id that
-    /// is not an id (`{"jsonrpc":"2.0","id":true}`), is not flagged as ambiguous — although the
-    /// same messages with a wrong version are. Every combination of members is tried here
-    /// against the rule as the flags' documentation states it.
+    /// Classifies every combination of envelope members and checks attribution for rejected messages.
     @Test func flagsFollowTheShapeOfTheMessage() {
         let versions: [String?] = [#""jsonrpc":"2.0""#, #""jsonrpc":"1.0""#, nil]
         let ids: [(text: String?, valid: Bool)] = [(nil, false), (#""id":4"#, true), (#""id":"s""#, true), (#""id":null"#, false), (#""id":true"#, false)]
@@ -744,8 +734,10 @@ private struct QueueModel {
                                 let isReply = !hasMethod && (result != nil || error != nil)
                                 let expected = Flags(isNotification: hasMethod && id.text == nil, isAmbiguous: !hasMethod && !isReply, isReply: isReply)
                                 // Valid when the version is right, the id (if any) is an id, and the rest fits its kind.
+                                let hasValidReplyPayload = (result != nil && error == nil)
+                                    || (result == nil && error == errors[1])
                                 let wellFormed = version == versions[0] && (id.text == nil || id.valid)
-                                    && (hasMethod ? params != paramsForms[2] : id.valid && isReply)
+                                    && (hasMethod ? params != paramsForms[2] : id.valid && hasValidReplyPayload)
                                 switch Self.classify(text) {
                                 case .invalid(_, _, let flags):
                                     invalid += 1

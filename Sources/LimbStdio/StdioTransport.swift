@@ -9,6 +9,10 @@ import Glibc
 #elseif canImport(Musl)
 import Musl
 #endif
+#if os(Linux)
+import CDispatch
+import CLimbPosix
+#endif
 
 /// Newline-delimited JSON-RPC over a pair of file descriptors: stdin and stdout by default,
 /// or any stream (a Unix socket, a TCP connection) that uses the same framing.
@@ -34,13 +38,17 @@ public struct StdioTransport: Sendable {
     public var output: Int32
     /// Whether `run` points descriptor 1 at stderr for as long as the session runs, so that
     /// stray writes to stdout cannot corrupt the protocol. The protocol itself goes out
-    /// through a private duplicate of the original stdout, and descriptor 1 is restored when
-    /// `run` returns. Applies only while `output` is `STDOUT_FILENO`, and nothing is done when
-    /// stderr is not open.
+    /// through a private duplicate of the original stdout. The transport restores descriptor 1
+    /// when `run` returns if it still points to the redirected destination. Coordinate any
+    /// concurrent replacement of stdout with `run`. Protection applies when `output` is
+    /// `STDOUT_FILENO` and stderr is open.
     ///
     /// `true` for `init()`, `false` for `init(input:output:)`: descriptors given explicitly
     /// are the caller's business, and the process's stdout may be something else entirely.
     public var protectsStandardOutput: Bool
+    package var beforeKeyedWrite: (@Sendable ([UInt8]) -> Void)? = nil
+    package var afterFirstByte: (@Sendable ([UInt8]) -> Void)? = nil
+    package var beforeWriteAccounting: (@Sendable () -> Void)? = nil
 
     /// Standard input and standard output, with stray output to stdout sent to stderr.
     public init() {
@@ -76,23 +84,29 @@ extension Server {
     /// stderr while the session runs and is restored when `run` returns. Output that `print`
     /// buffered before `run` and had not written yet goes to stderr too, and what the session's
     /// stray output left in the buffer is flushed to stderr before stdout is restored. Child
-    /// processes started meanwhile inherit stderr as their stdout. Another session with the
-    /// same setting may run at the same time: descriptor 1 is restored when the last one ends.
+    /// processes started meanwhile inherit stderr as their stdout. Only one session using
+    /// stdin or stdout may run at once. A second such call reports a diagnostic and returns.
     ///
-    /// `SIGPIPE` is ignored for the whole process from the first call on and never restored:
-    /// a peer that closed its end must surface as `EPIPE`, not kill the process, and a writer
-    /// left behind may still write after `run` returned. The setting survives `exec`, so child
-    /// processes that handlers start see `EPIPE` instead of being killed by `SIGPIPE`; reset it
-    /// in the child (`posix_spawnattr_setsigdefault`) for programs that rely on the signal.
+    /// A closed output is handled as `EPIPE` with the application's `SIGPIPE` disposition
+    /// intact. On Darwin the writer of a non-socket output temporarily enables
+    /// `F_SETNOSIGPIPE` on the shared open file description. Limb reserves the endpoint
+    /// until the writer exits, which can be after `run` returns when output stops draining.
+    /// Another session using that endpoint is rejected. Coordinate host writes and changes
+    /// to that option on aliased descriptors with the writer's lifetime.
     public func run(_ transport: StdioTransport = StdioTransport()) async {
-        signal(SIGPIPE, SIG_IGN)
+        let usesStandardStreams = transport.input == STDIN_FILENO || transport.output == STDOUT_FILENO
+        if usesStandardStreams, !StandardStreamOwnership.acquire() {
+            configuration.diagnostics("stdio: stdin or stdout already belongs to another session")
+            return
+        }
+        defer { if usesStandardStreams { StandardStreamOwnership.release() } }
 
         var transport = transport
         let realStandardOutput =
             transport.protectsStandardOutput && transport.output == STDOUT_FILENO
             ? StandardOutputProtection.begin() : nil
-        if let realStandardOutput { transport.output = realStandardOutput }
-        defer { if realStandardOutput != nil { StandardOutputProtection.end() } }
+        if let realStandardOutput { transport.output = realStandardOutput.saved }
+        defer { if let realStandardOutput { StandardOutputProtection.end(realStandardOutput) } }
 
         let queue = OutboundQueue(budgetBytes: configuration.budgets.maxOutboundBytes)
         let connection = connect(to: queue)
@@ -116,7 +130,7 @@ extension Server {
         // finish for: the writer ends the grace period and requests in flight are cancelled.
         await connection.close()
         queue.close()
-        if await !session.writerFinished() {
+        if await session.drainWriter() {
             // The peer keeps its end open and has stopped reading. The writer thread stays
             // blocked in `write` until the peer reads or goes away — nothing can interrupt it
             // without touching the descriptor — but the server does not wait for that. The
@@ -128,58 +142,137 @@ extension Server {
     }
 }
 
-/// Keeps stray writes to descriptor 1 off the protocol while default-transport sessions run.
-///
-/// Process-wide state, because descriptor 1 is: the first session saves the real stdout and
-/// points descriptor 1 at stderr, later ones share the saved descriptor, and the last one to
-/// end restores it.
-private enum StandardOutputProtection {
-    private struct State {
-        /// A close-on-exec duplicate of the real stdout while any session is protecting it.
-        var saved: Int32 = -1
-        var sessions = 0
+private enum StandardStreamOwnership {
+    private static let active = Mutex(false)
+
+    static func acquire() -> Bool {
+        active.withLock {
+            guard !$0 else { return false }
+            $0 = true
+            return true
+        }
     }
 
-    private static let state = Mutex(State())
+    static func release() { active.withLock { $0 = false } }
+}
+
+private struct StdioWriterOutput: Sendable {
+    let descriptor: Int32
+
+    #if canImport(Darwin)
+    // Use the live file identity conservatively. Separate opens of one file may compare
+    // equal. Reject their overlapping use instead of assuming they share a signal option.
+    private struct Identity: Hashable, Sendable {
+        let device: dev_t
+        let inode: ino_t
+        let type: mode_t
+    }
+
+    private static let reserved = Mutex<Set<Identity>>([])
+    private let socket: Bool
+    private let reservation: Identity?
+    private let restoreSignalOption: Bool
+    #endif
+
+    enum SetupError: Error {
+        case inUse
+        case posix(Int32)
+    }
+
+    init(_ descriptor: Int32) throws(SetupError) {
+        self.descriptor = descriptor
+        #if canImport(Darwin)
+        guard descriptor >= 0 else {
+            socket = false
+            reservation = nil
+            restoreSignalOption = false
+            return
+        }
+        var information = stat()
+        guard fstat(descriptor, &information) == 0 else { throw .posix(errno) }
+        let type = information.st_mode & mode_t(S_IFMT)
+        socket = type == mode_t(S_IFSOCK)
+        if socket {
+            reservation = nil
+            restoreSignalOption = false
+            return
+        }
+
+        let identity = Identity(device: information.st_dev, inode: information.st_ino, type: type)
+        guard Self.reserved.withLock({ $0.insert(identity).inserted }) else { throw .inUse }
+        let previous = fcntl(descriptor, F_GETNOSIGPIPE)
+        if previous < 0 || (previous == 0 && fcntl(descriptor, F_SETNOSIGPIPE, 1) < 0) {
+            let failure = errno
+            Self.reserved.withLock { _ = $0.remove(identity) }
+            throw .posix(failure)
+        }
+        reservation = identity
+        restoreSignalOption = previous == 0
+        #endif
+    }
+
+    func write(_ bytes: UnsafeRawPointer?, count: Int) -> Int {
+        #if canImport(Darwin)
+        if socket { return Darwin.send(descriptor, bytes, count, MSG_NOSIGNAL) }
+        return Darwin.write(descriptor, bytes, count)
+        #elseif canImport(Glibc)
+        return Glibc.write(descriptor, bytes, count)
+        #else
+        return Musl.write(descriptor, bytes, count)
+        #endif
+    }
+
+    func closeAndRestore() -> Int32? {
+        guard descriptor >= 0 else { return nil }
+        #if canImport(Darwin)
+        if let reservation {
+            return Self.reserved.withLock { endpoints in
+                let failure = restoreSignalOption && fcntl(descriptor, F_SETNOSIGPIPE, 0) < 0 ? errno : nil
+                close(descriptor)
+                endpoints.remove(reservation)
+                return failure
+            }
+        }
+        #endif
+        close(descriptor)
+        return nil
+    }
+}
+
+/// Keeps stray writes to descriptor 1 off the protocol while default-transport sessions run.
+/// Called by the sole owner of the standard streams.
+private enum StandardOutputProtection {
+    struct Redirect {
+        let saved: Int32
+        let destination: stat
+    }
 
     /// Points descriptor 1 at stderr. Returns a descriptor for the real stdout, to write the
     /// protocol to, or `nil` when nothing was changed: stderr or stdout is not open, or no
     /// descriptor is left to save stdout in. The session then uses descriptor 1 as it is.
-    static func begin() -> Int32? {
-        state.withLock { state in
-            if state.sessions > 0 {
-                state.sessions += 1
-                return state.saved
-            }
-            // A closed stderr: there is nowhere better for stray output to go.
-            guard fcntl(STDERR_FILENO, F_GETFD) != -1 else { return nil }
-            let saved = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0)
-            guard saved >= 0 else { return nil }
-            // Not flushed first: what `print` has buffered and not written yet was meant for
-            // stdout before the protocol started, and on a pipe — stdout is fully buffered
-            // there — that is everything printed so far. In the protocol stream it would be the
-            // first thing the client reads, so it goes to stderr as well.
-            guard redirect(STDERR_FILENO, to: STDOUT_FILENO) else {
-                close(saved)
-                return nil
-            }
-            state.saved = saved
-            state.sessions = 1
-            return saved
+    static func begin() -> Redirect? {
+        // A closed stderr: there is nowhere better for stray output to go.
+        var destination = stat()
+        guard fstat(STDERR_FILENO, &destination) == 0 else { return nil }
+        let saved = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0)
+        guard saved >= 0 else { return nil }
+        // Buffered ordinary stdout output goes to stderr when flushed during the session.
+        guard redirect(STDERR_FILENO, to: STDOUT_FILENO) else {
+            close(saved)
+            return nil
         }
+        return Redirect(saved: saved, destination: destination)
     }
 
-    static func end() {
-        state.withLock { state in
-            state.sessions -= 1
-            guard state.sessions == 0 else { return }
-            // Stray output still in the C library's buffer belongs to the session: it goes to
-            // stderr now rather than into the protocol stream once stdout is back.
-            fflush(nil)
-            _ = redirect(state.saved, to: STDOUT_FILENO)
-            close(state.saved)
-            state.saved = -1
-        }
+    static func end(_ protection: Redirect) {
+        defer { close(protection.saved) }
+        var current = stat()
+        let destination = protection.destination
+        guard fstat(STDOUT_FILENO, &current) == 0, current.st_dev == destination.st_dev,
+            current.st_ino == destination.st_ino, current.st_rdev == destination.st_rdev else { return }
+        // Stray output still in the C library's buffer belongs to the session while redirected.
+        fflush(nil)
+        _ = redirect(protection.saved, to: STDOUT_FILENO)
     }
 
     private static func redirect(_ source: Int32, to target: Int32) -> Bool {
@@ -198,6 +291,9 @@ final class StdioSession: Sendable {
     /// How long the writer may stand still once the input has ended; `nil` for as long as it takes.
     private let drainLimit: Duration?
     private let diagnostics: @Sendable (String) -> Void
+    private let beforeKeyedWrite: (@Sendable ([UInt8]) -> Void)?
+    private let afterFirstByte: (@Sendable ([UInt8]) -> Void)?
+    private let beforeWriteAccounting: (@Sendable () -> Void)?
     /// Written to wake the reader out of `poll` when it must stop without end of input, and the
     /// writer when draining begins. Nobody reads it: once written, it stays readable.
     private let wake: (read: Int32, write: Int32)
@@ -219,8 +315,13 @@ final class StdioSession: Sendable {
     private struct Completion {
         var readerDone = false
         var writerDone = false
+        /// The writer is about to close its descriptor. The watchdog can no longer poll it.
+        var writerFinishing = false
+        /// The writer settled its frame but has yet to remove its charge from the queue.
+        var frameFinished = false
         /// The session stopped waiting for the writer; set before any waiter could be missed.
         var writerAbandoned = false
+        var backpressuredAtDeadline = false
         var cleanedUp = false
         /// When the writer last got bytes out.
         var lastProgress = ContinuousClock.now
@@ -247,6 +348,9 @@ final class StdioSession: Sendable {
         self.maxFrameBytes = maxFrameBytes
         self.drainLimit = drainLimit
         self.diagnostics = diagnostics
+        beforeKeyedWrite = transport.beforeKeyedWrite
+        afterFirstByte = transport.afterFirstByte
+        beforeWriteAccounting = transport.beforeWriteAccounting
         // Close-on-exec like the duplicate: a child process a handler starts must not inherit
         // the session's descriptors.
         var descriptors: [Int32] = [-1, -1]
@@ -261,7 +365,7 @@ final class StdioSession: Sendable {
             descriptors = [-1, -1]
         }
         #else
-        let created = pipe2(&descriptors, O_CLOEXEC) == 0
+        let created = limb_cloexec_pipe(&descriptors) == 0
         wakeError = created ? nil : errno
         if !created { descriptors = [-1, -1] }
         #endif
@@ -282,9 +386,21 @@ final class StdioSession: Sendable {
             diagnostics("stdio: could not duplicate the output descriptor: \(String(cString: strerror(duplicationError)))")
             return false
         }
-        guard spawnThread(name: writerThreadName, { self.writeLoop() }) else {
-            diagnostics("stdio: could not start the writer thread")
+        let writerOutput: StdioWriterOutput
+        do {
+            writerOutput = try StdioWriterOutput(output)
+        } catch {
+            switch error {
+            case .inUse: diagnostics("stdio: the output endpoint already belongs to another writer")
+            case .posix(let code): diagnostics("stdio: could not prepare the writer output: \(String(cString: strerror(code)))")
+            }
             if output >= 0 { close(output) }
+            queue.close()
+            return false
+        }
+        guard spawnThread(name: writerThreadName, { self.writeLoop(writingTo: writerOutput) }) else {
+            diagnostics("stdio: could not start the writer thread")
+            closeWriterOutput(writerOutput)
             queue.close()
             return false
         }
@@ -335,13 +451,12 @@ final class StdioSession: Sendable {
         }
     }
 
-    /// Waits for the writer to drain the queue and stop. Returns `false` if it stopped making
-    /// progress for `drainLimit` first: it is then left behind, blocked on a peer that is not
-    /// reading.
+    /// Waits for the writer to drain the queue and stop, or leaves it behind at `drainLimit`.
+    /// Returns whether the output was backpressured at the deadline and needs a diagnostic.
     ///
     /// The limit is on standing still, not on the total: a peer that reads slowly but keeps
     /// reading gets everything, however long it takes. Call after the queue is closed.
-    func writerFinished() async -> Bool {
+    func drainWriter() async -> Bool {
         let started = ContinuousClock.now
         completion.withLock { $0.draining = true }
         // A writer waiting for room without a timeout must start timing its retries now.
@@ -351,19 +466,26 @@ final class StdioSession: Sendable {
                 var deadline = started + limit
                 while true {
                     guard (try? await Task.sleep(until: deadline, clock: .continuous)) != nil else { return }
-                    // With nothing left to write the writer is about to see the closed, empty
-                    // queue and end. It is not standing still, however long it takes to notice.
-                    let usage = queue.usage
-                    if usage.ordinaryBytes + usage.urgentBytes == 0 { return }
                     var next: ContinuousClock.Instant?
                     let waiter: CheckedContinuation<Void, Never>? = completion.withLock { state in
-                        guard !state.writerDone else { return nil }
+                        guard !state.writerFinishing else { return nil }
+                        // Read the queue under the same lock as frameFinished. When no frame
+                        // remains, just wait for the writer to notice the closed queue.
+                        let usage = queue.usage
+                        guard usage.ordinaryBytes != 0 || usage.urgentBytes != 0 else { return nil }
                         let idleSince = Swift.max(state.lastProgress, started)
                         if ContinuousClock.now - idleSince < limit {
                             next = idleSince + limit
                             return nil
                         }
                         state.writerAbandoned = true
+                        // A settled frame still counted by the queue can itself have filled
+                        // the last buffer. Only probe if there is more work to write. The
+                        // writer takes this same lock before closing its duplicate.
+                        if output >= 0, !state.frameFinished || usage.queuedFrames > 0 {
+                            var descriptor = pollfd(fd: output, events: Int16(POLLOUT), revents: 0)
+                            state.backpressuredAtDeadline = poll(&descriptor, 1, 0) == 0
+                        }
                         defer { state.writerWaiter = nil }
                         return state.writerWaiter
                     }
@@ -382,7 +504,7 @@ final class StdioSession: Sendable {
             if done { continuation.resume() }
         }
         watchdog?.cancel()
-        return completion.withLock { $0.writerDone }
+        return completion.withLock { !$0.writerDone && $0.backpressuredAtDeadline }
     }
 
     // MARK: Reader
@@ -490,25 +612,24 @@ final class StdioSession: Sendable {
 
     // MARK: Writer
 
-    private func writeLoop() {
-        var buffer: [UInt8] = []
-        buffer.reserveCapacity(64 * 1024)
+    private func writeLoop(writingTo writerOutput: StdioWriterOutput) {
         var healthy = true
-        while let frames = queue.take() {
+        #if !canImport(Darwin)
+        var blocked = sigset_t()
+        sigemptyset(&blocked)
+        sigaddset(&blocked, SIGPIPE)
+        let status = pthread_sigmask(SIG_BLOCK, &blocked, nil)
+        if status != 0 {
+            diagnostics("stdio: could not suppress SIGPIPE for the writer: \(String(cString: strerror(status)))")
+            queue.close()
+            stopReading()
+            connection.endGracePeriod()
+            healthy = false
+        }
+        #endif
+        while let frame = queue.takeFrame() {
             if healthy {
-                for frame in frames {
-                    if frame.count >= 32 * 1024 {
-                        // Large frames go out from their own storage instead of being copied.
-                        healthy = flush(&buffer) && writeAll(frame)
-                        buffer.append(0x0A)
-                    } else {
-                        buffer.append(contentsOf: frame)
-                        buffer.append(0x0A)
-                    }
-                    if !healthy { break }
-                }
-                // Everything queued so far leaves in one write: fewer system calls under load.
-                healthy = healthy && flush(&buffer)
+                healthy = writeFrame(frame, writingTo: writerOutput)
                 if !healthy {
                     // The peer is gone. Stop accepting output, wake the reader to shut down, and
                     // cancel what is in flight: whether or not the input has ended already,
@@ -518,9 +639,13 @@ final class StdioSession: Sendable {
                     connection.endGracePeriod()
                 }
             }
+            completion.withLock { $0.frameFinished = true }
+            beforeWriteAccounting?()
             queue.didWrite()
+            completion.withLock { $0.frameFinished = false }
         }
-        if output >= 0 { close(output) }
+        completion.withLock { $0.writerFinishing = true }
+        closeWriterOutput(writerOutput)
         let waiter = completion.withLock { state in
             state.writerDone = true
             defer { state.writerWaiter = nil }
@@ -529,40 +654,106 @@ final class StdioSession: Sendable {
         waiter?.resume()
     }
 
-    private func flush(_ buffer: inout [UInt8]) -> Bool {
-        guard !buffer.isEmpty else { return true }
-        defer { buffer.removeAll(keepingCapacity: true) }
-        return writeAll(buffer)
+    private func closeWriterOutput(_ output: StdioWriterOutput) {
+        if let error = output.closeAndRestore() {
+            diagnostics("stdio: could not restore the output SIGPIPE option: \(String(cString: strerror(error)))")
+        }
+    }
+
+    private func writeFrame(_ frame: OutboundQueue.FrameLease, writingTo writerOutput: StdioWriterOutput) -> Bool {
+        var offset = 0
+        var bytes = frame.bytes
+        let appendedNewline = bytes.count < 32 * 1024
+        if appendedNewline { bytes.append(0x0A) }
+        if frame.key == nil {
+            // Unkeyed frames cannot be withdrawn by cancellation.
+            _ = queue.writeIfCurrent(frame) { _ in 1 }
+        } else {
+            beforeKeyedWrite?(frame.bytes)
+            while queue.isCurrent(frame) {
+                // This session is the only writer to its stream. Wait without queue locks,
+                // then attempt at most one byte so a blocked peer cannot hold the queue lock.
+                var outputReady = pollfd(fd: output, events: Int16(POLLOUT), revents: 0)
+                if output >= 0 {
+                    let readiness = poll(&outputReady, 1, 0)
+                    if readiness < 0 {
+                        let error = errno
+                        if error == EINTR { continue }
+                        reportWriteFailure(error)
+                        return false
+                    }
+                    if readiness == 0 {
+                        waitForRoom()
+                        continue
+                    }
+                }
+                var writeError: Int32 = 0
+                let attempt = queue.writeIfCurrent(frame) { _ in
+                    bytes.withUnsafeBytes { raw in
+                        let count = writerOutput.write(raw.baseAddress, count: 1)
+                        if count < 0 { writeError = errno }
+                        return count
+                    }
+                }
+                guard let attempt else { return true }
+                if attempt == 1 {
+                    offset = 1
+                    completion.withLock { $0.lastProgress = ContinuousClock.now }
+                    afterFirstByte?(frame.bytes)
+                    break
+                }
+                if writeError == EINTR { continue }
+                if writeError == EAGAIN {
+                    waitForRoom()
+                    continue
+                }
+                reportWriteFailure(writeError)
+                return false
+            }
+            guard offset > 0 else { return true }
+        }
+        return writeAll(bytes, from: offset, writingTo: writerOutput, finishesFrame: appendedNewline) &&
+            (appendedNewline || writeAll([0x0A], writingTo: writerOutput, finishesFrame: true))
+    }
+
+    private func reportWriteFailure(_ error: Int32) {
+        if error == 0 {
+            diagnostics("stdio: write failed: the output accepted no bytes")
+        } else if !meansPeerIsGone(error) {
+            diagnostics("stdio: write failed: \(String(cString: strerror(error)))")
+        }
     }
 
     /// Writes all of `bytes`, however many `write` calls it takes.
     ///
     /// A large frame goes out in pieces. A blocking `write` of the whole frame would return only
     /// when all of it is through, and until then nobody could tell a peer that reads slowly from
-    /// one that has stopped. The rule that follows: while draining, a peer that takes at least
-    /// a kilobyte per `outputDrainSeconds` is still reading; one piece that was already under
-    /// way when draining began may be up to 16 KiB. The kilobyte is approximate where the
-    /// kernel makes room only in larger units: a Linux pipe frees space a whole page (4 KiB) at
-    /// a time, so there a peer must take about a page per `outputDrainSeconds`.
-    private func writeAll(_ bytes: [UInt8]) -> Bool {
-        let output = self.output
+    /// one that has stopped. The drain timer measures successful writes. Once draining begins,
+    /// each new write uses at most 1 KiB, while an earlier write can still be up to 16 KiB.
+    /// The kernel can free buffer space in larger units, such as pages for a Linux pipe.
+    private func writeAll(
+        _ bytes: [UInt8], from start: Int = 0, writingTo writerOutput: StdioWriterOutput, finishesFrame: Bool
+    ) -> Bool {
         return bytes.withUnsafeBytes { raw in
-            var offset = 0
+            var offset = start
             while offset < raw.count {
                 // Small pieces once the session is only waiting for the output to drain: that is
                 // when "is the peer still reading?" is asked, and the answer must not take the
                 // time a slow peer needs for a large piece.
                 let pieceSize = completion.withLock { $0.draining } ? 1024 : 16 * 1024
-                let written = write(output, raw.baseAddress! + offset, Swift.min(raw.count - offset, pieceSize))
+                let written = writerOutput.write(raw.baseAddress! + offset, count: Swift.min(raw.count - offset, pieceSize))
                 if written > 0 {
                     offset += written
-                    completion.withLock { $0.lastProgress = ContinuousClock.now }
+                    completion.withLock { state in
+                        state.lastProgress = ContinuousClock.now
+                        if finishesFrame, offset == raw.count { state.frameFinished = true }
+                    }
                     continue
                 }
                 if written == 0 {
                     // Not an error, so `errno` says nothing; but an output that takes nothing
                     // and does not say why will not take more on the next try either.
-                    diagnostics("stdio: write failed: the output accepted no bytes")
+                    reportWriteFailure(0)
                     return false
                 }
                 let error = errno
@@ -572,9 +763,7 @@ final class StdioSession: Sendable {
                     waitForRoom()
                     continue
                 }
-                if !meansPeerIsGone(error) {
-                    diagnostics("stdio: write failed: \(String(cString: strerror(error)))")
-                }
+                reportWriteFailure(error)
                 return false
             }
             return true
@@ -669,7 +858,7 @@ private func runThread(_ context: UnsafeMutableRawPointer) {
     #else
     // A name is a convenience for whoever looks at the process; failing to set one is not
     // worth stopping for.
-    _ = pthread_setname_np(pthread_self(), start.name)
+    limb_name_current_thread(start.name)
     #endif
     start.body()
 }

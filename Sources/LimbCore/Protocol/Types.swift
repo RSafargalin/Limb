@@ -128,7 +128,7 @@ public struct ClientCapabilities: Sendable, Hashable {
     /// Form elicitation. An empty `elicitation` object means form mode, for backward compatibility.
     public var supportsElicitation: Bool {
         guard let elicitation = raw["elicitation"]?.objectValue else { return false }
-        return elicitation["form"] != nil || elicitation["url"] == nil
+        return elicitation.isEmpty || elicitation["form"]?.objectValue != nil
     }
 
     public var supportsURLElicitation: Bool { raw["elicitation"]?["url"]?.objectValue != nil }
@@ -401,9 +401,11 @@ public struct ToolResult: Sendable, Hashable, WireEncodable {
         writer.key("content")
         writer.beginArray()
         for block in content { block.encode(to: &writer, profile: profile) }
-        if content.isEmpty, let structuredContent {
-            // The serialized JSON as text: the only form older clients can read, and the
-            // backward-compatible duplicate the specification asks for otherwise.
+        if let structuredContent, !content.contains(where: { block in
+            guard case .text(let text, _, _) = block else { return false }
+            return (try? JSON.parseStrict(text)) == structuredContent
+        }) {
+            // Keep the serialized JSON available to clients that only display text blocks.
             ContentBlock.text(structuredContent.description).encode(to: &writer, profile: profile)
         }
         writer.endArray()

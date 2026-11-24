@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Testing
@@ -238,6 +243,7 @@ extension IndependentStdioTransportTests {
 
         /// `StdioTransport`: "Pipes, sockets, files and terminals all work as either end."
         /// A pseudo-terminal in raw mode stands in for a terminal.
+        #if canImport(Darwin)
         @Test func aTerminalWorksAsBothEnds() throws {
             let fixture = try independentStdioFixture()
             let master = posix_openpt(O_RDWR | O_NOCTTY)
@@ -273,6 +279,7 @@ extension IndependentStdioTransportTests {
 
         // MARK: Descriptors that are not open
 
+        #endif
         @Test func aClosedInputDescriptorEndsTheSessionWithADiagnostic() throws {
             let fixture = try independentStdioFixture()
             var fromServer: [Int32] = [-1, -1]

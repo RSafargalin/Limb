@@ -1,3 +1,8 @@
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Foundation
 import Limb
 import Synchronization
@@ -30,7 +35,7 @@ final class Peer: @unchecked Sendable {
         case .socketpair:
             // One socket as both stdin and stdout: how Node spawns child processes.
             var sockets: [Int32] = [0, 0]
-            precondition(socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0)
+            precondition(socketpair(AF_UNIX, independentStdioStreamSocket, 0, &sockets) == 0)
             writeEnd = sockets[0]
             readEnd = sockets[0]
             let transport = StdioTransport(input: sockets[1], output: sockets[1])
@@ -91,7 +96,7 @@ final class Peer: @unchecked Sendable {
     }
 
     func closeInput() {
-        if writeEnd == readEnd { shutdown(writeEnd, SHUT_WR) } else { close(writeEnd) }
+        if writeEnd == readEnd { shutdown(writeEnd, Int32(SHUT_WR)) } else { close(writeEnd) }
     }
 
     /// Whether the server's `run` returned within the time limit.
@@ -316,7 +321,7 @@ final class Gate: Sendable {
     }
 
     /// The old body of the test above: the peer closes its end, and the server's writes fail
-    /// with EPIPE. `Peer` no longer ignores SIGPIPE itself, so this also shows that `run` does.
+    /// with EPIPE. The writer handles the closed pipe without terminating the process.
     @Test func aPeerThatClosedItsEndDoesNotCrashOrHangTheServer() async throws {
         let peer = Peer(try makeStdioServer())
         _ = peer.initialize()

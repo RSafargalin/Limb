@@ -69,8 +69,9 @@ public struct ElicitRequest: Sendable, Hashable, WireEncodable {
     public func encode(to writer: inout JSONWriter, profile: RevisionProfile) {
         writer.beginObject()
         switch mode {
-        case .form(let requestedSchema):
+        case .form(var requestedSchema):
             if profile.urlElicitation { writer.field("mode", "form") }
+            if requestedSchema["properties"] == nil { requestedSchema["properties"] = [:] }
             writer.field("message", message)
             writer.field("requestedSchema", requestedSchema)
         case .url(let url):

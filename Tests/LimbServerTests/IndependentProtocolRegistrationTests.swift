@@ -336,12 +336,12 @@ private let serverInfoKey = "io.modelcontextprotocol/serverInfo"
         #expect(result["_meta"]?[serverInfoKey]?["name"] == "cache")
         let violations = IndependentProtocolSchema.r2026_07_28.violations(in: result, as: "InputRequiredResult")
         #expect(violations.isEmpty, "\(violations)")
-        // The retry completes, and the complete result has its hints.
+        // A personalized retry completes with private hints and a zero TTL.
         let done = try await client.request(
             "resources/read",
             ["uri": "c://asks", "requestState": result["requestState"] ?? nil, "inputResponses": ["who": ["action": "accept", "content": ["name": "Ada"]]]])
         #expect(done["result"]?["contents"]?[0]?["text"] == "for Ada", "\(done)")
-        #expect(done["result"]?["ttlMs"] == 9_000 && done["result"]?["cacheScope"] == "public")
+        #expect(done["result"]?["ttlMs"] == 0 && done["result"]?["cacheScope"] == "private")
     }
 
     // MARK: The server's identity in results (2026-07-28)

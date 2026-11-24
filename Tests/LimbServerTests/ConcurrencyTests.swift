@@ -98,7 +98,7 @@ import Testing
             try server.register(tool: ToolDefinition(name: "t1", inputSchema: ["type": "object", "$ref": "https://example.com/schema.json"])) { _, _ in .text("") }
         }
         #expect(throws: RegistrationError.self) {
-            try server.register(tool: ToolDefinition(name: "t2", inputSchema: ["type": "object", "unevaluatedProperties": false])) { _, _ in .text("") }
+            try server.register(tool: ToolDefinition(name: "t2", inputSchema: ["type": "object", "unevaluatedProperties": "invalid"])) { _, _ in .text("") }
         }
         #expect(throws: RegistrationError.self) {
             try server.register(tool: ToolDefinition(name: "t3", inputSchema: ["type": "array"])) { _, _ in .text("") }

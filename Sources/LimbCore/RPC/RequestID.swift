@@ -4,16 +4,17 @@
 /// the two never convert into each other.
 public enum RequestID: Sendable, Hashable, CustomStringConvertible {
     case string(String)
+    /// Use an integer JSON number for protocol IDs.
     case number(JSONNumber)
 
     public init(_ value: Int) { self = .number(JSONNumber(value)) }
     public init(_ value: String) { self = .string(value) }
 
-    /// Reads an id from a message. `null` and non-scalar ids are not valid in MCP.
+    /// Reads an ID from a message. An MCP ID is a string or a mathematical integer.
     public init?(json: JSONValue) {
         switch json {
         case .string(let value): self = .string(value)
-        case .number(let value): self = .number(value)
+        case .number(let value) where value.isInteger: self = .number(value)
         default: return nil
         }
     }

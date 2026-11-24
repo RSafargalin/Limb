@@ -46,8 +46,11 @@ public struct JSONParseError: Error, Sendable, Equatable, CustomStringConvertibl
 
 /// Limits and strictness for parsing. Every parser is attack surface, so the limits are on by default.
 public struct JSONParseOptions: Sendable {
-    /// Maximum nesting of arrays and objects. Values above `depthCeiling` have no effect.
-    public var maxDepth: Int
+    /// Maximum nesting of arrays and objects. Negative values become zero.
+    /// Values above `depthCeiling` have no effect.
+    public var maxDepth: Int {
+        didSet { if maxDepth < 0 { maxDepth = 0 } }
+    }
     /// The deepest nesting any parse accepts, whatever `maxDepth` says.
     ///
     /// The parser itself could go deeper — it does not recurse. The value it returns cannot:
@@ -58,14 +61,17 @@ public struct JSONParseOptions: Sendable {
     public static let depthCeiling = 256
     /// Maximum number of values in the whole document. Bounds memory amplification:
     /// `[0,0,0,…]` costs two input bytes but a full `JSONValue` per element.
-    public var maxNodes: Int
+    /// Negative values become zero.
+    public var maxNodes: Int {
+        didSet { if maxNodes < 0 { maxNodes = 0 } }
+    }
     /// Reject objects that repeat a key. Parsers disagree on which duplicate wins, which is
     /// a known way to smuggle a value past one component and into another.
     public var rejectDuplicateKeys: Bool
 
     public init(maxDepth: Int = 128, maxNodes: Int = 1_000_000, rejectDuplicateKeys: Bool = true) {
-        self.maxDepth = maxDepth
-        self.maxNodes = maxNodes
+        self.maxDepth = max(0, maxDepth)
+        self.maxNodes = max(0, maxNodes)
         self.rejectDuplicateKeys = rejectDuplicateKeys
     }
 

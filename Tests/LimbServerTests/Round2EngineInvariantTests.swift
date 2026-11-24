@@ -1,4 +1,8 @@
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Limb
 import LimbTesting
 import Synchronization
@@ -353,6 +357,7 @@ struct Round2EngineInvariantTests {
         #expect(update["params"]?["_meta"]?[MetaKey.subscriptionID] == "retry")
     }
 
+    #if canImport(Darwin)
     /// Reader-built members of a batch are kept in memory until the batch's handler members end,
     /// outside every budget: a few kilobytes of requests hold hundreds of megabytes. Measures
     /// the process's resident memory, so it does not run with the suite.
@@ -383,7 +388,9 @@ struct Round2EngineInvariantTests {
         #expect(client.queue.usage.ordinaryBytes == 0)
         #expect(grown < 50 * sent, "\(sent) bytes of requests grew resident memory by \(grown / 1_000_000) MB")
     }
+    #endif
 
+    #if canImport(Darwin)
     private static func residentBytes() -> Int {
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
@@ -394,6 +401,7 @@ struct Round2EngineInvariantTests {
         }
         return result == KERN_SUCCESS ? Int(info.resident_size) : 0
     }
+    #endif
 
     @Test(arguments: [(64 << 10, 1 << 20), (64 << 10, 16 << 10), (8 << 10, 64 << 10), (64 << 10, 2 << 10)])
     func aDeadPeerOfReaderAnswersStaysWithinBudgetPlusOneFramePlusReserve(budget: Int, reserve: Int) throws {
