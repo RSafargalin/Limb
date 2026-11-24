@@ -3,6 +3,7 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+import Dispatch
 import Foundation
 import Limb
 import Synchronization
@@ -359,6 +360,31 @@ extension IndependentStdioTransportTests {
             }
             #expect(stuck == 0)
             #expect(fixture.log.all.count == 0, "\(fixture.log.all.count) of 300 idle sessions were reported as a peer that did not read")
+        }
+
+        @Test(arguments: [0.0, 0.001], [false, true])
+        func aDeliveredFrameStillChargedToTheQueueDoesNotDiagnoseASlowPeer(limit: Double, closeOutput: Bool) throws {
+            let fixture = try independentStdioFixture { $0.outputDrainSeconds = limit }
+            let frameWritten = DispatchSemaphore(value: 0)
+            let finishAccounting = DispatchSemaphore(value: 0)
+            let client = Client(fixture.server, channel: closeOutput ? .socketpair : .pipes).start { transport in
+                transport.beforeWriteAccounting = {
+                    frameWritten.signal()
+                    if finishAccounting.wait(timeout: .now() + .seconds(15)) == .timedOut {
+                        Issue.record("The test did not release the writer")
+                    }
+                }
+            }
+            defer {
+                finishAccounting.signal()
+                client.tearDown()
+            }
+            try #require(client.initialize() == "2025-11-25")
+            try #require(frameWritten.wait(timeout: .now() + .seconds(5)) == .success)
+            if closeOutput { client.closeOutput() }
+            client.closeInput()
+            try #require(client.stopped(within: 5))
+            #expect(fixture.log.all.isEmpty, "\(fixture.log.all)")
         }
 
         @Test func aZeroDeadlineDoesNotLoseAnswersOfAReadingClient() throws {

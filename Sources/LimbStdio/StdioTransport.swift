@@ -48,6 +48,7 @@ public struct StdioTransport: Sendable {
     public var protectsStandardOutput: Bool
     package var beforeKeyedWrite: (@Sendable ([UInt8]) -> Void)? = nil
     package var afterFirstByte: (@Sendable ([UInt8]) -> Void)? = nil
+    package var beforeWriteAccounting: (@Sendable () -> Void)? = nil
 
     /// Standard input and standard output, with stray output to stdout sent to stderr.
     public init() {
@@ -129,7 +130,7 @@ extension Server {
         // finish for: the writer ends the grace period and requests in flight are cancelled.
         await connection.close()
         queue.close()
-        if await !session.writerFinished() {
+        if await session.drainWriter() {
             // The peer keeps its end open and has stopped reading. The writer thread stays
             // blocked in `write` until the peer reads or goes away — nothing can interrupt it
             // without touching the descriptor — but the server does not wait for that. The
@@ -292,6 +293,7 @@ final class StdioSession: Sendable {
     private let diagnostics: @Sendable (String) -> Void
     private let beforeKeyedWrite: (@Sendable ([UInt8]) -> Void)?
     private let afterFirstByte: (@Sendable ([UInt8]) -> Void)?
+    private let beforeWriteAccounting: (@Sendable () -> Void)?
     /// Written to wake the reader out of `poll` when it must stop without end of input, and the
     /// writer when draining begins. Nobody reads it: once written, it stays readable.
     private let wake: (read: Int32, write: Int32)
@@ -313,8 +315,11 @@ final class StdioSession: Sendable {
     private struct Completion {
         var readerDone = false
         var writerDone = false
+        /// The writer is about to close its descriptor. The watchdog can no longer poll it.
+        var writerFinishing = false
         /// The session stopped waiting for the writer; set before any waiter could be missed.
         var writerAbandoned = false
+        var backpressuredAtDeadline = false
         var cleanedUp = false
         /// When the writer last got bytes out.
         var lastProgress = ContinuousClock.now
@@ -343,6 +348,7 @@ final class StdioSession: Sendable {
         self.diagnostics = diagnostics
         beforeKeyedWrite = transport.beforeKeyedWrite
         afterFirstByte = transport.afterFirstByte
+        beforeWriteAccounting = transport.beforeWriteAccounting
         // Close-on-exec like the duplicate: a child process a handler starts must not inherit
         // the session's descriptors.
         var descriptors: [Int32] = [-1, -1]
@@ -443,13 +449,12 @@ final class StdioSession: Sendable {
         }
     }
 
-    /// Waits for the writer to drain the queue and stop. Returns `false` if it stopped making
-    /// progress for `drainLimit` first: it is then left behind, blocked on a peer that is not
-    /// reading.
+    /// Waits for the writer to drain the queue and stop, or leaves it behind at `drainLimit`.
+    /// Returns whether the output was backpressured at the deadline and needs a diagnostic.
     ///
     /// The limit is on standing still, not on the total: a peer that reads slowly but keeps
     /// reading gets everything, however long it takes. Call after the queue is closed.
-    func writerFinished() async -> Bool {
+    func drainWriter() async -> Bool {
         let started = ContinuousClock.now
         completion.withLock { $0.draining = true }
         // A writer waiting for room without a timeout must start timing its retries now.
@@ -462,16 +467,24 @@ final class StdioSession: Sendable {
                     // With nothing left to write the writer is about to see the closed, empty
                     // queue and end. It is not standing still, however long it takes to notice.
                     let usage = queue.usage
-                    if usage.ordinaryBytes + usage.urgentBytes == 0 { return }
+                    if usage.ordinaryBytes == 0, usage.urgentBytes == 0 { return }
                     var next: ContinuousClock.Instant?
                     let waiter: CheckedContinuation<Void, Never>? = completion.withLock { state in
-                        guard !state.writerDone else { return nil }
+                        guard !state.writerFinishing else { return nil }
                         let idleSince = Swift.max(state.lastProgress, started)
                         if ContinuousClock.now - idleSince < limit {
                             next = idleSince + limit
                             return nil
                         }
                         state.writerAbandoned = true
+                        // The queue still charges a frame after the kernel has accepted it and
+                        // even after the peer has read it. At a short drain limit that is enough
+                        // to stop waiting, but only a non-writable output signals backpressure.
+                        // The writer takes this same lock before closing its duplicate.
+                        if output >= 0 {
+                            var descriptor = pollfd(fd: output, events: Int16(POLLOUT), revents: 0)
+                            state.backpressuredAtDeadline = poll(&descriptor, 1, 0) == 0
+                        }
                         defer { state.writerWaiter = nil }
                         return state.writerWaiter
                     }
@@ -490,7 +503,7 @@ final class StdioSession: Sendable {
             if done { continuation.resume() }
         }
         watchdog?.cancel()
-        return completion.withLock { $0.writerDone }
+        return completion.withLock { !$0.writerDone && $0.backpressuredAtDeadline }
     }
 
     // MARK: Reader
@@ -625,8 +638,10 @@ final class StdioSession: Sendable {
                     connection.endGracePeriod()
                 }
             }
+            beforeWriteAccounting?()
             queue.didWrite()
         }
+        completion.withLock { $0.writerFinishing = true }
         closeWriterOutput(writerOutput)
         let waiter = completion.withLock { state in
             state.writerDone = true
