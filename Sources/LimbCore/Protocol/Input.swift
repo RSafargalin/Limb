@@ -138,6 +138,13 @@ public struct SamplingResult: Sendable, Hashable, JSONDecodable {
     public var model: String
     public var stopReason: String?
 
+    public init(role: Role, content: JSONValue, model: String, stopReason: String? = nil) {
+        self.role = role
+        self.content = content
+        self.model = model
+        self.stopReason = stopReason
+    }
+
     public init(json: JSONValue) throws(JSONDecodingError) {
         let object = try JSONObject(json: json)
         let roleName = try object.required("role", as: String.self)

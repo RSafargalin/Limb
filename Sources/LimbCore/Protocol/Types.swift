@@ -58,6 +58,20 @@ public struct Icon: Sendable, Hashable, JSONEncodable {
         self.theme = theme
     }
 
+    package init(wire value: JSONValue) throws(JSONDecodingError) {
+        let icon = try JSONObject(json: value)
+        var theme: Theme?
+        if let name = try icon.wireOptional("theme", as: String.self) {
+            guard let known = Theme(rawValue: name) else {
+                throw JSONDecodingError("expected light or dark", path: ["theme"])
+            }
+            theme = known
+        }
+        try self.init(
+            src: icon.required("src"), mimeType: icon.wireOptional("mimeType"),
+            sizes: icon.wireOptional("sizes"), theme: theme)
+    }
+
     public func encode(to writer: inout JSONWriter) {
         writer.beginObject()
         writer.field("src", src)

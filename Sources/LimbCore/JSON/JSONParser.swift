@@ -105,16 +105,29 @@ public enum JSON {
     public static func parse(
         _ bytes: Span<UInt8>, options: JSONParseOptions = .default
     ) throws(JSONParseError) -> JSONValue {
+        #if FoundationJSON
+        try validateUTF8(bytes)
+        return try FoundationJSON.parse(bytes, options: options)
+        #else
+        return try parseStrict(bytes, options: options)
+        #endif
+    }
+
+    /// Preserve number text and enforce the supplied limits on protocol input even when
+    /// the Foundation codec is selected for general JSON parsing.
+    package static func parseStrict(
+        _ bytes: Span<UInt8>, options: JSONParseOptions = .default
+    ) throws(JSONParseError) -> JSONValue {
+        try validateUTF8(bytes)
+        return try parseValidated(bytes, options: options)
+    }
+
+    private static func validateUTF8(_ bytes: Span<UInt8>) throws(JSONParseError) {
         do {
             _ = try UTF8Span(validating: bytes)
         } catch {
             throw JSONParseError(kind: .invalidUTF8, offset: error.byteOffsets.lowerBound)
         }
-        #if FoundationJSON
-        return try FoundationJSON.parse(bytes, options: options)
-        #else
-        return try parseValidated(bytes, options: options)
-        #endif
     }
 
     public static func parse(

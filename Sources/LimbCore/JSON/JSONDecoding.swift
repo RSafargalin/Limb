@@ -136,6 +136,14 @@ extension Dictionary: JSONDecodable where Key == String, Value: JSONDecodable {
 }
 
 extension JSONObject {
+    /// Read an optional wire member, checking its type whenever it is present.
+    package func wireOptional<T: JSONDecodable>(
+        _ key: String, as type: T.Type = T.self
+    ) throws(JSONDecodingError) -> T? {
+        guard self[key] != nil else { return nil }
+        return try required(key, as: type)
+    }
+
     /// Decodes a member that must be present.
     public func required<T: JSONDecodable>(_ key: String, as type: T.Type = T.self) throws(JSONDecodingError) -> T {
         guard let value = self[key] else { throw JSONDecodingError("missing required field", path: [key]) }

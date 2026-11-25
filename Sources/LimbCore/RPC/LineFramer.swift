@@ -34,6 +34,8 @@ public struct LineFramer: Sendable {
     /// Whether a partial frame is waiting for more input.
     public var hasPartialFrame: Bool { end > frameStart && !discarding }
 
+    package var isDiscardingOversizedFrame: Bool { discarding }
+
     /// Whether every buffered byte has been examined, i.e. `next()` has returned `nil`.
     private var isDrained: Bool { scanned == end }
 

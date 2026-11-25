@@ -46,6 +46,14 @@ struct IndependentElicitationAndStructuredOutputTests {
 
     private static let validSchemas: [JSONValue] = [
         [
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "Contact information",
+            "description": "Used for the greeting",
+            "type": "object",
+            "properties": ["name": ["type": "string", "description": "The name to use"]],
+            "required": ["name"],
+        ],
+        [
             "type": "object",
             "properties": ["name": ["type": "string", "default": "Ada"], "confirmed": ["type": "boolean", "default": false]],
         ],

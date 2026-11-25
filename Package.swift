@@ -50,6 +50,8 @@ let package = Package(
         // JSON, JSON-RPC, revisions, errors, framing, schema validation.
         .target(name: "LimbCore", dependencies: [.target(name: "CLimbPosix", condition: .when(platforms: [.linux]))], swiftSettings: settings),
         .target(name: "CLimbPosix"),
+        .target(name: "LimbClient", dependencies: ["LimbCore"], swiftSettings: settings),
+        .target(name: "LimbStdioClient", dependencies: ["LimbCore", "LimbClient"], swiftSettings: settings),
         // @Tool and @Schema. A compiler plugin: built for the build machine, never linked into the app.
         .macro(
             name: "LimbMacros",
@@ -76,11 +78,21 @@ let package = Package(
             dependencies: ["LimbCore", "LimbServer", .target(name: "CLimbPosix", condition: .when(platforms: [.linux]))],
             swiftSettings: settings),
         // Umbrella: `import Limb`.
-        .target(name: "Limb", dependencies: ["LimbCore", "LimbServer", "LimbStdio"], swiftSettings: settings),
+        .target(
+            name: "Limb",
+            dependencies: [
+                "LimbCore", "LimbClient", "LimbServer", "LimbStdio",
+                .target(name: "LimbStdioClient", condition: .when(platforms: [.macOS])),
+            ],
+            swiftSettings: settings),
         // In-memory harness for user tests.
         .target(name: "LimbTesting", dependencies: ["Limb"], swiftSettings: settings),
 
         .testTarget(name: "LimbCoreTests", dependencies: ["LimbCore"], swiftSettings: testSettings),
+        .testTarget(name: "LimbClientTests", dependencies: ["LimbCore", "LimbClient"], swiftSettings: testSettings),
+        .testTarget(
+            name: "LimbStdioClientTests", dependencies: ["Limb", "LimbStdioClient", "LimbClient", "LimbCore"],
+            swiftSettings: testSettings),
         .testTarget(name: "LimbServerTests", dependencies: ["Limb", "LimbTesting"], swiftSettings: testSettings),
         .testTarget(
             name: "LimbStdioTests",
